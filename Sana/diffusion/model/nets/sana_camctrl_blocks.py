@@ -307,7 +307,8 @@ def world_to_ray_mats(
     raymats[..., :3, 3] = t_w2l
     raymats[..., 3, 3] = 1.0
     mask = torch.isnan(d_world).any(-1)
-    raymats[mask] = torch.eye(4, device=device, dtype=dtype)
+    eye4 = torch.eye(4, device=device, dtype=dtype)
+    raymats = torch.where(mask.unsqueeze(-1).unsqueeze(-1), eye4, raymats)
     return raymats
 
 
@@ -486,16 +487,24 @@ def _apply_complex_rope(
     hidden_states: torch.Tensor,
     freqs: torch.Tensor,
     inverse: bool = False,
+    cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Apply complex RoPE (compiled: fuses fp64 cast + view_as_complex + multiply chain)."""
-    x_real = hidden_states.to(torch.float64)
-    if x_real.stride(-1) != 1:
-        x_real = x_real.contiguous()
-    x_complex = torch.view_as_complex(x_real.unflatten(-1, (-1, 2)))
+    """Apply rotary embedding in FP32 real arithmetic (avoids slow FP64/complex128 on MUSA)."""
+    x_pair = hidden_states.float().unflatten(-1, (-1, 2))
+    x0 = x_pair[..., 0]
+    x1 = x_pair[..., 1]
+    if cos_sin is not None:
+        cos, sin = cos_sin
+    else:
+        cos = freqs.real.float()
+        sin = freqs.imag.float()
     if inverse:
-        freqs = freqs.conj()
-    x_out = torch.view_as_real(x_complex * freqs).flatten(-2, -1)
-    return x_out.type_as(hidden_states)
+        out0 = x0 * cos + x1 * sin
+        out1 = x1 * cos - x0 * sin
+    else:
+        out0 = x0 * cos - x1 * sin
+        out1 = x1 * cos + x0 * sin
+    return torch.stack((out0, out1), dim=-1).flatten(-2, -1).type_as(hidden_states)
 
 
 def _apply_block_diagonal(
@@ -540,8 +549,9 @@ def _prepare_ray_apply_fns(
 ) -> Tuple[Callable, Callable, Callable]:
     """Build ``(apply_q, apply_kv, apply_o)`` block-diagonal callables for UCPE."""
     if rotary_emb is not None:
-        rope_fn = partial(_apply_complex_rope, freqs=rotary_emb, inverse=False)
-        rope_fn_inv = partial(_apply_complex_rope, freqs=rotary_emb, inverse=True)
+        cos_sin = (rotary_emb.real.float().contiguous(), rotary_emb.imag.float().contiguous())
+        rope_fn = partial(_apply_complex_rope, freqs=rotary_emb, inverse=False, cos_sin=cos_sin)
+        rope_fn_inv = partial(_apply_complex_rope, freqs=rotary_emb, inverse=True, cos_sin=cos_sin)
     else:
         rope_fn = lambda x: x
         rope_fn_inv = lambda x: x
@@ -586,6 +596,164 @@ def _slice_rope_for_cam(
     h_part = rotary_emb[..., orig_t_size : orig_t_size + new_h_size]
     w_part = rotary_emb[..., orig_t_size + orig_h_size : orig_t_size + orig_h_size + new_w_size]
     return torch.cat([t_part, h_part, w_part], dim=-1)
+
+
+def _process_camera_conditions_raymats_only(camera_conditions, B, HW, patch_size):
+    """Convert ``(B, F, 20)`` camera conditions into ``raymats`` only (skips unused absmap)."""
+    F_dim = camera_conditions.shape[1]
+    C_to_W = camera_conditions[..., :16].view(B, F_dim, 4, 4)
+    fx = camera_conditions[..., 16]
+    fy = camera_conditions[..., 17]
+    cx = camera_conditions[..., 18]
+    cy = camera_conditions[..., 19]
+    H_dim, W_dim = HW[1], HW[2]
+    image_width = W_dim * patch_size[2]
+    image_height = H_dim * patch_size[1]
+    xi = torch.zeros((B, F_dim), device=camera_conditions.device, dtype=camera_conditions.dtype)
+    x_fov = compute_fov_from_fx_xi(
+        fx, xi, image_width, device=camera_conditions.device, dtype=camera_conditions.dtype
+    ).view(B, F_dim)
+    y_fov = compute_fov_from_fx_xi(
+        fy, xi, image_height, device=camera_conditions.device, dtype=camera_conditions.dtype
+    ).view(B, F_dim)
+    d_cam = ucm_unproject_grid_fov(
+        x_fov,
+        y_fov,
+        xi,
+        H_dim,
+        W_dim,
+        cx / patch_size[2],
+        cy / patch_size[1],
+        device=camera_conditions.device,
+        dtype=camera_conditions.dtype,
+    )
+    if d_cam.ndim == 4 and d_cam.shape[0] == B * F_dim:
+        d_cam = d_cam.view(B, F_dim, H_dim, W_dim, 3)
+    return world_to_ray_mats(d_cam, C_to_W)
+
+
+class UCPEForwardCache:
+    """Plain read-only cache of per-step UCPE raymats and RoPE tables shared across blocks."""
+
+    __slots__ = (
+        "cam_cond_id",
+        "HW",
+        "head_dim",
+        "P",
+        "P_T",
+        "P_inv",
+        "rotary_emb_cam",
+        "rope_cos_main",
+        "rope_sin_main",
+        "rope_cos_cam",
+        "rope_sin_cam",
+        "prope_fns",
+    )
+
+    def __init__(
+        self,
+        cam_cond_id,
+        HW,
+        head_dim,
+        P,
+        P_T,
+        P_inv,
+        rotary_emb_cam,
+        rope_cos_main,
+        rope_sin_main,
+        rope_cos_cam,
+        rope_sin_cam,
+        prope_fns,
+    ):
+        self.cam_cond_id = cam_cond_id
+        self.HW = HW
+        self.head_dim = head_dim
+        self.P = P
+        self.P_T = P_T
+        self.P_inv = P_inv
+        self.rotary_emb_cam = rotary_emb_cam
+        self.rope_cos_main = rope_cos_main
+        self.rope_sin_main = rope_sin_main
+        self.rope_cos_cam = rope_cos_cam
+        self.rope_sin_cam = rope_sin_cam
+        self.prope_fns = prope_fns
+
+
+def _prepare_rope_cos_sin(rotary_emb, N: int, D: int, device):
+    if rotary_emb is None:
+        return (
+            torch.ones(N, D, device=device, dtype=torch.float32),
+            torch.zeros(N, D, device=device, dtype=torch.float32),
+        )
+    freqs = rotary_emb.squeeze(0).squeeze(0)
+    cos_half = freqs.real.float()
+    sin_half = freqs.imag.float()
+    rope_cos = cos_half.repeat_interleave(2, dim=-1).contiguous()
+    rope_sin = torch.stack([-sin_half, sin_half], dim=-1).reshape(N, D).contiguous()
+    return rope_cos, rope_sin
+
+
+def prepare_ucpe_cache(
+    head_dim: int,
+    camera_conditions: torch.Tensor,
+    HW: Tuple[int, int, int],
+    patch_size: Tuple[int, int, int],
+    rotary_emb: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> UCPEForwardCache:
+    """Compute UCPE P/P_T/P_inv, RoPE cos/sin tables, and prope_fns once per forward."""
+    B = camera_conditions.shape[0]
+    N = HW[0] * HW[1] * HW[2]
+    device = camera_conditions.device
+
+    P = P_inv = rotary_emb_cam = None
+    cam_pos_embeds = kwargs.get("cam_pos_embeds", None)
+    if cam_pos_embeds is not None:
+        P = cam_pos_embeds.get("P")
+        P_inv = cam_pos_embeds.get("P_inv")
+        rotary_emb_cam = cam_pos_embeds.get("pos_embeds_cam")
+        if P is not None and P_inv is not None:
+            if P.ndim == 3:
+                P = P.unsqueeze(0).repeat(B, 1, 1, 1)
+            if P_inv.ndim == 3:
+                P_inv = P_inv.unsqueeze(0).repeat(B, 1, 1, 1)
+            P = P.contiguous()
+            P_T = P.transpose(-1, -2).contiguous()
+            P_inv = P_inv.contiguous()
+            if rotary_emb_cam is not None and rotary_emb_cam.ndim == 3:
+                rotary_emb_cam = rotary_emb_cam.unsqueeze(0).repeat(B, 1, 1, 1)
+            elif rotary_emb_cam is None and rotary_emb is not None:
+                rotary_emb_cam = _slice_rope_for_cam(rotary_emb, head_dim, head_dim // 2)
+            elif rotary_emb_cam is None:
+                rotary_emb_cam = rotary_emb
+
+    if P is None or P_inv is None:
+        if kwargs.get("raymats") is not None:
+            raymats = kwargs["raymats"]
+        else:
+            raymats = _process_camera_conditions_raymats_only(camera_conditions, B, HW, patch_size)
+        P = raymats.reshape(B, -1, 4, 4)
+        P_T = P.transpose(-1, -2).contiguous()
+        P_inv = _invert_SE3(P).contiguous()
+        rotary_emb_cam = _slice_rope_for_cam(rotary_emb, head_dim, head_dim // 2) if rotary_emb is not None else None
+
+    prope_fns = _prepare_ray_apply_fns(head_dim=head_dim, P=P, P_T=P_T, P_inv=P_inv, rotary_emb=rotary_emb_cam)
+    rope_cos_main, rope_sin_main = _prepare_rope_cos_sin(rotary_emb, N, head_dim, device)
+    rope_cos_cam, rope_sin_cam = _prepare_rope_cos_sin(rotary_emb_cam, N, head_dim // 2, device)
+    return UCPEForwardCache(
+        cam_cond_id=id(camera_conditions),
+        HW=HW,
+        head_dim=head_dim,
+        P=P,
+        P_T=P_T,
+        P_inv=P_inv,
+        rotary_emb_cam=rotary_emb_cam,
+        rope_cos_main=rope_cos_main,
+        rope_sin_main=rope_sin_main,
+        rope_cos_cam=rope_cos_cam,
+        rope_sin_cam=rope_sin_cam,
+        prope_fns=prope_fns,
+    )
 
 
 def prepare_prope_fns(
@@ -636,7 +804,7 @@ def prepare_prope_fns(
     if "raymats" in kwargs and kwargs["raymats"] is not None:
         raymats = kwargs["raymats"]
     else:
-        raymats, _ = _process_camera_conditions_ucpe(camera_conditions, B, HW, patch_size)
+        raymats = _process_camera_conditions_raymats_only(camera_conditions, B, HW, patch_size)
     raymats = raymats.reshape(B, -1, 4, 4)
 
     P = raymats

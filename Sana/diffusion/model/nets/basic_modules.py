@@ -243,17 +243,28 @@ class GLUMBConvTemp(GLUMBConv):
 
         assert len(HW) == 3, "HW must be a tuple of (T, H, W)"
         T, H, W = HW
+        frame_mask = kwargs.get("frame_valid_mask", None)
+        cp_active = cp_enabled() and get_cp_group() is not None
+        if not cp_active:
+            from diffusion.model.musa_ops.glumbconv import (
+                can_use_fused_glumbconv_temp,
+                fused_glumbconv_temp_forward,
+            )
+
+            if can_use_fused_glumbconv_temp(self, x, HW):
+                return fused_glumbconv_temp_forward(
+                    self, x, HW, frame_mask=frame_mask, ln_stats=kwargs.get("_x_mlp_ln_stats", None)
+                )
+
         x = x.reshape(B * T, H, W, C).permute(0, 3, 1, 2)
 
         x = self._apply_spatial_autochunked(x)
 
         # Temporal aggregation
         x_reshaped = x.view(B, T, C, H * W).permute(0, 2, 1, 3)
-        frame_mask = kwargs.get("frame_valid_mask", None)
         if frame_mask is not None:
             frame_mask = frame_mask.reshape(B, T).to(x_reshaped)
             x_reshaped = x_reshaped * frame_mask[:, None, :, None]
-        cp_active = cp_enabled() and get_cp_group() is not None
 
         if cp_active and self.t_conv.padding[0] > 0:
             halo = int(self.t_conv.padding[0])

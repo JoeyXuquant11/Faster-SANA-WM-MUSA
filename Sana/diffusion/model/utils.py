@@ -15,6 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import re
 from collections.abc import Iterable
 from functools import lru_cache
@@ -43,11 +44,53 @@ to_3tuple = _ntuple(3)
 def set_grad_checkpoint(model, gc_step=1):
     assert isinstance(model, nn.Module)
 
-    def set_attr(module):
-        module.grad_checkpointing = True
+    # SANA_GC_NUM_BLOCKS:
+    #   "gdn:K" (default "gdn:7"): checkpoint only the first K cheapest GDN blocks (never Softmax blocks)
+    #   "0" / "none": disable GC on all blocks
+    #   "all": legacy behavior (GC on all modules)
+    #   integer K: GC on first K blocks in model.blocks
+    #   comma-separated indices (e.g. "0,1,2,4,5"): exact block indices
+    policy = os.environ.get("SANA_GC_NUM_BLOCKS", "gdn:9").strip().lower()
+
+    if policy == "all":
+        def set_attr(module):
+            module.grad_checkpointing = True
+            module.grad_checkpointing_step = gc_step
+
+        model.apply(set_attr)
+        return
+
+    def clear_attr(module):
+        module.grad_checkpointing = False
         module.grad_checkpointing_step = gc_step
 
-    model.apply(set_attr)
+    model.apply(clear_attr)
+
+    if policy in ("0", "none", "false", ""):
+        return
+
+    blocks = getattr(model, "blocks", None)
+    if blocks is None:
+        return
+
+    n_blocks = len(blocks)
+    if policy.startswith("gdn:"):
+        k = max(0, int(policy.split(":", 1)[1]))
+        gdn_indices = [
+            i for i, blk in enumerate(blocks)
+            if "softmax" not in type(getattr(blk, "attn", None)).__name__.lower()
+        ]
+        indices = set(gdn_indices[:k])
+    elif "," in policy:
+        indices = {int(tok.strip()) for tok in policy.split(",") if tok.strip()}
+    else:
+        k = max(0, min(n_blocks, int(policy)))
+        indices = set(range(k))
+
+    for idx in indices:
+        if 0 <= idx < n_blocks:
+            blocks[idx].grad_checkpointing = True
+            blocks[idx].grad_checkpointing_step = gc_step
 
 
 def set_fp32_attention(model):
@@ -66,6 +109,8 @@ def auto_grad_checkpoint(module, *args, **kwargs):
             return checkpoint_sequential(module, gc_step, *args, **kwargs)
         else:
             return checkpoint(module, *args, **kwargs)
+    kwargs.pop("use_reentrant", None)
+    kwargs.pop("preserve_rng_state", None)
     return module(*args, **kwargs)
 
 

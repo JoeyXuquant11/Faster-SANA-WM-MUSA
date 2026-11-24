@@ -8,6 +8,8 @@ using native PyTorch tensor ops (muBLAS on Moore Threads MTT S5000) with standar
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +29,17 @@ from diffusion.model.nets.sana_gdn_blocks import (
 from diffusion.model.nets.sana_gdn_camctrl_blocks import (
     BidirectionalGDNUCPESinglePathLiteLA,
     ChunkCausalGDNUCPESinglePathLiteLA,
+)
+from diffusion.model.musa_ops.bidi_gdn import (
+    _FusedBidiCamScanAndOutFn,
+    _FusedBidiMainScanFn,
+    _FusedCamPrepAndScanFn,
+    _FusedCamPrepFn,
+    _FusedMainPrepAndScanFn,
+    _FusedMainPrepFn,
+    can_use_fused_bidi_gdn,
+    fused_bidi_short_conv4,
+    gdn_use_bf16_bmm,
 )
 from diffusion.model.registry import ATTENTION_BLOCKS
 
@@ -263,7 +276,59 @@ def _bidi_gdn_main_forward(
     S = H_s * W_s
     H, D = self.heads, self.dim
 
-    qkv = self.qkv(x).reshape(B, N, 3, H, D)
+    from diffusion.model.musa_ops.block_fusion import fast_linear_bf16
+    precomputed_gates = kwargs.get("precomputed_gates", None)
+    if precomputed_gates is not None:
+        beta, decay = precomputed_gates
+    else:
+        beta, decay = self._compute_frame_gates(x, HW)
+
+    ucpe_cache = kwargs.get("_ucpe_cache", None)
+    if (
+        ucpe_cache is not None
+        and ucpe_cache.HW == HW
+        and ucpe_cache.head_dim == D
+        and ucpe_cache.rope_cos_main is not None
+    ):
+        rope_cos, rope_sin = ucpe_cache.rope_cos_main, ucpe_cache.rope_sin_main
+    else:
+        rope_cos, rope_sin = _prepare_rope_tables(rotary_emb, N, D, x.device)
+
+    k_scale = (D ** -0.5) * (S ** -0.5)
+    has_norm = not isinstance(self.q_norm, nn.Identity)
+    norm_eps = float(getattr(self.q_norm, "eps", 1e-5)) if has_norm else 1e-5
+
+    if can_use_fused_bidi_gdn(x, H, D):
+        ck_w = self.conv_k.weight if self.conv_k is not None else None
+        ck_b = self.conv_k.bias if self.conv_k is not None else None
+        q_nw = self.q_norm.weight if has_norm else None
+        k_nw = self.k_norm.weight if has_norm else None
+        use_bf16 = gdn_use_bf16_bmm()
+        precomputed_qkv = kwargs.get("precomputed_qkv", None)
+        if precomputed_qkv is not None:
+            qkv = precomputed_qkv.reshape(B, N, 3, H, D)
+            out = _FusedMainPrepAndScanFn.apply(
+                qkv, None, None, ck_w, ck_b, q_nw, k_nw, rope_cos, rope_sin, beta, decay,
+                B, H, T, S, k_scale, norm_eps, float(self.eps), use_bf16,
+            )
+        elif os.environ.get("SANA_RECOMPUTE_GDN_QKV", "0") != "0" and torch.is_grad_enabled():
+            out = _FusedMainPrepAndScanFn.apply(
+                x, self.qkv.weight, self.qkv.bias, ck_w, ck_b, q_nw, k_nw, rope_cos, rope_sin, beta, decay,
+                B, H, T, S, k_scale, norm_eps, float(self.eps), use_bf16,
+            )
+        else:
+            qkv = fast_linear_bf16(x, self.qkv.weight, self.qkv.bias).reshape(B, N, 3, H, D)
+            out = _FusedMainPrepAndScanFn.apply(
+                qkv, None, None, ck_w, ck_b, q_nw, k_nw, rope_cos, rope_sin, beta, decay,
+                B, H, T, S, k_scale, norm_eps, float(self.eps), use_bf16,
+            )
+        if apply_output_gate:
+            out = self._apply_output_gate(out, x)
+            out = self.proj(out.to(self.proj.weight.dtype))
+        return out
+
+    qkv = fast_linear_bf16(x, self.qkv.weight, self.qkv.bias).reshape(B, N, 3, H, D)
+
     q_raw = qkv[:, :, 0]
     k_raw = qkv[:, :, 1]
     v_raw = qkv[:, :, 2]
@@ -272,17 +337,11 @@ def _bidi_gdn_main_forward(
         k_conv = self._apply_temporal_short_conv(k_raw.contiguous().reshape(B, N, C), self.conv_k, HW)
         k_raw = k_conv.reshape(B, N, H, D)
 
-    precomputed_gates = kwargs.get("precomputed_gates", None)
-    if precomputed_gates is not None:
-        beta, decay = precomputed_gates
-    else:
-        beta, decay = self._compute_frame_gates(x, HW)
     beta = beta.float()
     decay = decay.float()
 
     q32, k32, v32 = q_raw.float(), k_raw.float(), v_raw.float()
-    if not isinstance(self.q_norm, nn.Identity):
-        norm_eps = float(getattr(self.q_norm, "eps", 1e-5))
+    if has_norm:
         q_inv_rms = torch.rsqrt((q32 * q32).sum(dim=(-1, -2)) / C + norm_eps)
         k_inv_rms = torch.rsqrt((k32 * k32).sum(dim=(-1, -2)) / C + norm_eps)
         q_nw = self.q_norm.weight.float().view(1, 1, H, D)
@@ -290,11 +349,9 @@ def _bidi_gdn_main_forward(
         q32 = q32 * q_inv_rms.view(B, N, 1, 1) * q_nw
         k32 = k32 * k_inv_rms.view(B, N, 1, 1) * k_nw
 
-    k_scale = (D ** -0.5) * (S ** -0.5)
     q_pos = torch.relu(q32)
     k_pos = torch.relu(k32) * k_scale
 
-    rope_cos, rope_sin = _prepare_rope_tables(rotary_emb, N, D, x.device)
     cos_b = rope_cos.view(1, N, 1, D)
     sin_b = rope_sin.view(1, N, 1, D)
     q_rot = q_pos * cos_b + _pair_swap(q_pos) * sin_b
@@ -361,45 +418,92 @@ class BidirectionalGDNUCPEMusa(BidirectionalGDNUCPESinglePathLiteLA):
         H_heads = self.cam_heads
         D_head = self.cam_head_dim
 
-        qkv_w = torch.cat([self.q_proj_cam.weight, self.k_proj_cam.weight, self.v_proj_cam.weight])
-        qkv_b = torch.cat([self.q_proj_cam.bias, self.k_proj_cam.bias, self.v_proj_cam.bias])
-        qkv_cam = F.linear(x, qkv_w, qkv_b)
-        q_raw, k_raw, v_raw = qkv_cam.chunk(3, dim=-1)
+        from diffusion.model.musa_ops.block_fusion import fast_linear_bf16
 
-        if self.conv_k_cam is not None:
-            k_raw = self._apply_temporal_short_conv(k_raw, self.conv_k_cam, HW)
+        precomputed_qkv_cam = kwargs.get("precomputed_qkv_cam", None)
+        if precomputed_qkv_cam is not None:
+            qkv_cam = precomputed_qkv_cam
+        else:
+            qkv_w = torch.cat([self.q_proj_cam.weight, self.k_proj_cam.weight, self.v_proj_cam.weight])
+            qkv_b = torch.cat([self.q_proj_cam.bias, self.k_proj_cam.bias, self.v_proj_cam.bias])
+            qkv_cam = fast_linear_bf16(x, qkv_w, qkv_b)
+
+        use_fused = can_use_fused_bidi_gdn(x, H_heads, D_head) and not isinstance(self.q_norm_cam, nn.Identity)
+
+        if not use_fused:
+            q_raw, k_raw, v_raw = qkv_cam.chunk(3, dim=-1)
+            if self.conv_k_cam is not None:
+                k_raw = self._apply_temporal_short_conv(k_raw, self.conv_k_cam, HW)
+
+        ucpe_cache = kwargs.get("_ucpe_cache", None)
+        use_cache = (
+            ucpe_cache is not None
+            and ucpe_cache.cam_cond_id == id(camera_conditions)
+            and ucpe_cache.HW == HW
+            and ucpe_cache.head_dim == D_head
+        )
+        if use_cache:
+            P = ucpe_cache.P
+            P_T = ucpe_cache.P_T
+            P_inv = ucpe_cache.P_inv
+            rotary_emb_cam = ucpe_cache.rotary_emb_cam
+            rope_cos = ucpe_cache.rope_cos_cam
+            rope_sin = ucpe_cache.rope_sin_cam
+            apply_fn_o = ucpe_cache.prope_fns[2]
+        else:
+            raymats = _process_camera_conditions_raymats_only(camera_conditions, B, HW, self.patch_size)
+            P = raymats.reshape(B, -1, 4, 4)
+            P_T = P.transpose(-1, -2).contiguous()
+            P_inv = _invert_SE3(P).contiguous()
+
+            if rotary_emb is not None:
+                head_dim = D_head
+                orig_t_size = head_dim // 2 - 2 * (head_dim // 6)
+                orig_h_size = head_dim // 6
+                new_head_dim = head_dim // 2
+                new_t_size = new_head_dim // 2 - 2 * (new_head_dim // 6)
+                new_h_size = new_head_dim // 6
+                new_w_size = new_head_dim // 6
+                t_part = rotary_emb[..., :new_t_size]
+                h_part = rotary_emb[..., orig_t_size : orig_t_size + new_h_size]
+                w_part = rotary_emb[..., orig_t_size + orig_h_size : orig_t_size + orig_h_size + new_w_size]
+                rotary_emb_cam = torch.cat([t_part, h_part, w_part], dim=-1)
+                rope_cos, rope_sin = _prepare_rope_tables(rotary_emb_cam, N, D_head // 2, x.device)
+            else:
+                rotary_emb_cam = None
+                rope_cos = torch.ones(N, D_head // 2, device=x.device, dtype=torch.float32)
+                rope_sin = torch.zeros(N, D_head // 2, device=x.device, dtype=torch.float32)
+            apply_fn_o = None if use_fused else _prepare_ray_apply_fns(
+                head_dim=D_head, P=P, P_T=P_T, P_inv=P_inv, rotary_emb=rotary_emb_cam,
+            )[2]
+
+        k_scale = (D_head ** -0.5) * (S ** -0.5)
+        norm_eps = float(getattr(self.q_norm_cam, "eps", getattr(self.q_norm_cam, "variance_epsilon", 1e-6)))
+
+        precomputed_gates = kwargs.get("precomputed_gates", None)
+        if precomputed_gates is not None:
+            beta, decay = precomputed_gates
+        else:
+            beta, decay = self._compute_frame_gates(x, HW)
+
+        if use_fused:
+            use_bf16 = gdn_use_bf16_bmm()
+            ck_w = self.conv_k_cam.weight if self.conv_k_cam is not None else None
+            ck_b = self.conv_k_cam.bias if self.conv_k_cam is not None else None
+            return _FusedCamPrepAndScanFn.apply(
+                qkv_cam, ck_w, ck_b,
+                self.q_norm_cam.weight, self.k_norm_cam.weight,
+                beta, decay,
+                P, P_T, P_inv, rope_cos, rope_sin,
+                B, H_heads, T, S, D_head, k_scale, norm_eps, use_bf16,
+            )
 
         q_raw = q_raw.contiguous().view(B, N, H_heads, D_head)
         k_raw = k_raw.contiguous().view(B, N, H_heads, D_head)
         v_raw = v_raw.contiguous().view(B, N, H_heads, D_head)
 
-        raymats = _process_camera_conditions_raymats_only(camera_conditions, B, HW, self.patch_size)
-        P = raymats.reshape(B, -1, 4, 4)
-        P_T = P.transpose(-1, -2).contiguous()
-        P_inv = _invert_SE3(P).contiguous()
-
-        if rotary_emb is not None:
-            head_dim = D_head
-            orig_t_size = head_dim // 2 - 2 * (head_dim // 6)
-            orig_h_size = head_dim // 6
-            new_head_dim = head_dim // 2
-            new_t_size = new_head_dim // 2 - 2 * (new_head_dim // 6)
-            new_h_size = new_head_dim // 6
-            new_w_size = new_head_dim // 6
-            t_part = rotary_emb[..., :new_t_size]
-            h_part = rotary_emb[..., orig_t_size : orig_t_size + new_h_size]
-            w_part = rotary_emb[..., orig_t_size + orig_h_size : orig_t_size + orig_h_size + new_w_size]
-            rotary_emb_cam = torch.cat([t_part, h_part, w_part], dim=-1)
-            rope_cos, rope_sin = _prepare_rope_tables(rotary_emb_cam, N, D_head // 2, x.device)
-        else:
-            rotary_emb_cam = None
-            rope_cos = torch.ones(N, D_head // 2, device=x.device, dtype=torch.float32)
-            rope_sin = torch.zeros(N, D_head // 2, device=x.device, dtype=torch.float32)
-
         q_norm_w = self.q_norm_cam.weight.float()
         k_norm_w = self.k_norm_cam.weight.float()
-        k_scale = (D_head ** -0.5) * (S ** -0.5)
-        norm_eps = float(getattr(self.q_norm_cam, "eps", getattr(self.q_norm_cam, "variance_epsilon", 1e-6)))
 
         q_cam_trans, k_cam_trans, v_cam_trans, inflation_sq = _cam_prep_torch(
             q_raw, k_raw, v_raw,
@@ -408,12 +512,6 @@ class BidirectionalGDNUCPEMusa(BidirectionalGDNUCPESinglePathLiteLA):
             rope_cos=rope_cos, rope_sin=rope_sin,
             k_scale=k_scale, norm_eps=norm_eps,
         )
-
-        precomputed_gates = kwargs.get("precomputed_gates", None)
-        if precomputed_gates is not None:
-            beta, decay = precomputed_gates
-        else:
-            beta, decay = self._compute_frame_gates(x, HW)
 
         inflation_sq_spatial = inflation_sq.view(B, H_heads, T, S)
         frame_inflation_sq = inflation_sq_spatial.mean(dim=-1)
@@ -428,9 +526,6 @@ class BidirectionalGDNUCPEMusa(BidirectionalGDNUCPESinglePathLiteLA):
         )
         out = out.to(dtype_orig)
 
-        _, _, apply_fn_o = _prepare_ray_apply_fns(
-            head_dim=D_head, P=P, P_T=P_T, P_inv=P_inv, rotary_emb=rotary_emb_cam,
-        )
         out = apply_fn_o(out.transpose(-1, -2)).transpose(-1, -2).contiguous()
         out = out.reshape(B, self.cam_dim, -1).permute(0, 2, 1)
         return out
@@ -446,23 +541,93 @@ class BidirectionalGDNUCPEMusa(BidirectionalGDNUCPESinglePathLiteLA):
         chunk_size: int | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        precomputed_gates = self._compute_frame_gates(x, HW) if HW is not None else None
-        main_raw = _bidi_gdn_main_forward(
-            self, x, mask=mask, HW=HW, rotary_emb=rotary_emb, block_mask=block_mask,
-            apply_output_gate=False, chunk_size=chunk_size, precomputed_gates=precomputed_gates, **kwargs,
+        from diffusion.model.musa_ops.block_fusion import (
+            can_use_block_fusion,
+            fast_linear_bf16,
+            fast_quad_linear_qkv_cam_beta_bf16,
+            fast_triple_linear_qkv_cam_bf16,
+            fused_add_silu_mul_proj,
         )
-        cam_contrib: torch.Tensor | int = 0
+
         camera_conditions = _maybe_drop_cam_branch(
             camera_conditions, kwargs.get("cam_branch_drop_prob", 0.0), self.training, x.device,
         )
+        use_triple = (
+            camera_conditions is not None
+            and HW is not None
+            and self.use_output_gate
+            and self.output_gate is not None
+            and can_use_fused_bidi_gdn(x, self.heads, self.dim)
+            and os.environ.get("SANA_RECOMPUTE_GDN_QKV", "0") == "0"
+            and can_use_block_fusion(x)
+        )
+        precomputed_x_frame = kwargs.get("_x_msa_frame", None)
+        x_ln_stats = kwargs.get("_x_msa_ln_stats", None)
+        use_quad_gdn = (
+            use_triple
+            and precomputed_x_frame is not None
+            and hasattr(self, "beta_proj")
+            and hasattr(self, "gate_proj")
+            and hasattr(self, "dt_bias")
+            and hasattr(self, "A_log")
+        )
+        precomputed_qkv = None
+        precomputed_qkv_cam = None
+        precomputed_g = None
+        if use_quad_gdn:
+            precomputed_qkv, precomputed_qkv_cam, precomputed_g, beta_logits = fast_quad_linear_qkv_cam_beta_bf16(
+                x,
+                self.qkv.weight, self.qkv.bias,
+                self.q_proj_cam.weight, self.k_proj_cam.weight, self.v_proj_cam.weight,
+                self.q_proj_cam.bias, self.k_proj_cam.bias, self.v_proj_cam.bias,
+                self.output_gate.weight, self.output_gate.bias,
+                self.beta_proj.weight, self.beta_proj.bias,
+                ln_stats=x_ln_stats,
+            )
+            B_g = x.shape[0]
+            T_g, H_g, W_g = HW
+            S_g = H_g * W_g
+            beta = beta_logits.sigmoid().reshape(B_g, T_g, S_g, self.heads).permute(0, 3, 1, 2)
+            a_out = F.linear(precomputed_x_frame, self.gate_proj.weight, self.gate_proj.bias).float()
+            dt = self.dt_bias.float().view(1, 1, -1)
+            A_val = self.A_log.float().exp().view(1, 1, -1)
+            decay = (-A_val * F.softplus(a_out + dt)).exp().transpose(1, 2)
+            precomputed_gates = (beta, decay)
+        else:
+            precomputed_gates = self._compute_frame_gates(x, HW) if HW is not None else None
+            if use_triple:
+                precomputed_qkv, precomputed_qkv_cam, precomputed_g = fast_triple_linear_qkv_cam_bf16(
+                    x,
+                    self.qkv.weight, self.qkv.bias,
+                    self.q_proj_cam.weight, self.k_proj_cam.weight, self.v_proj_cam.weight,
+                    self.q_proj_cam.bias, self.k_proj_cam.bias, self.v_proj_cam.bias,
+                    self.output_gate.weight, self.output_gate.bias,
+                )
+
+        main_raw = _bidi_gdn_main_forward(
+            self, x, mask=mask, HW=HW, rotary_emb=rotary_emb, block_mask=block_mask,
+            apply_output_gate=False, chunk_size=chunk_size, precomputed_gates=precomputed_gates,
+            precomputed_qkv=precomputed_qkv, **kwargs,
+        )
+        cam_contrib: torch.Tensor | int = 0
         if camera_conditions is not None:
             cam_raw = self._forward_cam_branch(
                 x, HW, camera_conditions, rotary_emb,
-                chunk_size=chunk_size, precomputed_gates=precomputed_gates, **kwargs,
+                chunk_size=chunk_size, precomputed_gates=precomputed_gates,
+                precomputed_qkv_cam=precomputed_qkv_cam, **kwargs,
             )
-            cam_contrib = self.out_proj_cam(cam_raw)
+            cam_contrib = fast_linear_bf16(cam_raw, self.out_proj_cam.weight, self.out_proj_cam.bias)
+        if (
+            isinstance(cam_contrib, torch.Tensor)
+            and self.use_output_gate
+            and self.output_gate is not None
+            and can_use_block_fusion(main_raw)
+            and cam_contrib.dtype == torch.bfloat16
+        ):
+            g = precomputed_g if precomputed_g is not None else fast_linear_bf16(x, self.output_gate.weight, self.output_gate.bias)
+            return fused_add_silu_mul_proj(main_raw, cam_contrib, g, self.proj.weight, self.proj.bias)
         combined = self._apply_output_gate(main_raw + cam_contrib, x)
-        return self.proj(combined.to(self.proj.weight.dtype))
+        return fast_linear_bf16(combined.to(self.proj.weight.dtype), self.proj.weight, self.proj.bias)
 
 
 def register_musa_gdn_fallbacks():

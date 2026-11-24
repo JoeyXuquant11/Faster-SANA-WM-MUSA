@@ -32,7 +32,124 @@ from mmcv.runner import build_optimizer as mm_build_optimizer
 from mmcv.utils import _BatchNorm, _InstanceNorm
 from termcolor import colored
 from torch.nn import GroupNorm, LayerNorm
-from torch.optim.optimizer import Optimizer
+from torch.optim.adam import adam as _torch_adam_fn
+from torch.optim.optimizer import Optimizer, _use_grad_for_differentiable
+
+
+class _BatchedGroupAdamW(torch.optim.AdamW):
+    """AdamW that preserves all per-parameter param_groups while batching
+    identical-hyperparameter groups into single multi-tensor _foreach calls."""
+
+    @_use_grad_for_differentiable
+    def step(self, closure=None):
+        self._cuda_graph_capture_health_check()
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        buckets = {}
+        bucket_order = []
+        for group in self.param_groups:
+            lr_val = group["lr"]
+            lr_key = ("t", id(lr_val)) if isinstance(lr_val, torch.Tensor) else ("f", float(lr_val))
+            key = (
+                lr_key,
+                tuple(group["betas"]),
+                float(group["weight_decay"]),
+                float(group["eps"]),
+                bool(group["amsgrad"]),
+                bool(group["maximize"]),
+                group["foreach"],
+                bool(group["capturable"]),
+                bool(group["differentiable"]),
+                bool(group["fused"]),
+                bool(group["decoupled_weight_decay"]),
+            )
+            bucket = buckets.get(key)
+            if bucket is None:
+                bucket = [group, [], [], [], [], [], [], False]
+                buckets[key] = bucket
+                bucket_order.append(key)
+            hc = self._init_group(
+                group,
+                bucket[1],
+                bucket[2],
+                bucket[3],
+                bucket[4],
+                bucket[5],
+                bucket[6],
+            )
+            if hc:
+                bucket[7] = True
+
+        from diffusion.model.musa_ops.fused_adamw import can_use_fused_adamw, fused_multi_tensor_adamw_step
+
+        grad_scale = getattr(self, "grad_scale", None)
+        found_inf = getattr(self, "found_inf", None)
+        pending_gs = getattr(self, "_pending_grad_scale", None)
+        if pending_gs is not None:
+            self._pending_grad_scale = None
+        for key in bucket_order:
+            group, params_with_grad, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps, has_complex = buckets[key]
+            if not params_with_grad:
+                continue
+            beta1, beta2 = group["betas"]
+            if can_use_fused_adamw(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                state_steps,
+                amsgrad=group["amsgrad"],
+                maximize=group["maximize"],
+                has_complex=has_complex,
+                decoupled_weight_decay=group["decoupled_weight_decay"],
+                grad_scale=grad_scale,
+                found_inf=found_inf,
+            ):
+                fused_multi_tensor_adamw_step(
+                    params_with_grad,
+                    grads,
+                    exp_avgs,
+                    exp_avg_sqs,
+                    state_steps,
+                    lr=group["lr"],
+                    beta1=beta1,
+                    beta2=beta2,
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    grad_scale_tensor=pending_gs,
+                )
+                continue
+            if pending_gs is not None:
+                torch._foreach_mul_(grads, pending_gs.squeeze(0))
+            _torch_adam_fn(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+                amsgrad=group["amsgrad"],
+                has_complex=has_complex,
+                beta1=beta1,
+                beta2=beta2,
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                eps=group["eps"],
+                maximize=group["maximize"],
+                foreach=group["foreach"],
+                capturable=group["capturable"],
+                differentiable=group["differentiable"],
+                fused=group["fused"],
+                grad_scale=grad_scale,
+                found_inf=found_inf,
+                decoupled_weight_decay=group["decoupled_weight_decay"],
+            )
+
+        return loss
 
 from .logger import get_root_logger
 
@@ -139,6 +256,54 @@ class MyOptimizerConstructor(DefaultOptimizerConstructor):
             self.add_params(params, child_mod, prefix=child_prefix, is_dcn_module=is_dcn_module)
 
 
+_FUSED_CLIP_INSTALLED = False
+
+
+def _install_fused_grad_clip_hook() -> None:
+    global _FUSED_CLIP_INSTALLED
+    if _FUSED_CLIP_INSTALLED or os.environ.get("SANA_OPT_FUSED_GRAD_CLIP", "1") == "0":
+        return
+    try:
+        from accelerate import Accelerator
+    except Exception:
+        return
+    if getattr(Accelerator.clip_grad_norm_, "_sana_fused_clip", False):
+        _FUSED_CLIP_INSTALLED = True
+        return
+    orig_clip = Accelerator.clip_grad_norm_
+
+    def _fused_clip_grad_norm_(self, parameters, max_norm, norm_type=2):
+        if (
+            os.environ.get("SANA_OPT_FUSED_GRAD_CLIP", "1") != "0"
+            and float(norm_type) == 2.0
+            and getattr(self, "scaler", None) is None
+        ):
+            target_opt = None
+            for opt_wrap in getattr(self, "_optimizers", ()):
+                inner = getattr(opt_wrap, "optimizer", opt_wrap)
+                if isinstance(inner, _BatchedGroupAdamW):
+                    target_opt = inner
+                    break
+            if target_opt is not None:
+                plist = [parameters] if isinstance(parameters, torch.Tensor) else list(parameters)
+                opt_pids = {id(p) for g in target_opt.param_groups for p in g["params"]}
+                grad_params = [p for p in plist if p.grad is not None]
+                if grad_params and all(id(p) in opt_pids for p in grad_params):
+                    from diffusion.model.musa_ops.fused_adamw import fused_l2_grad_clip_coef
+
+                    res = fused_l2_grad_clip_coef(grad_params, float(max_norm))
+                    if res is not None:
+                        total_norm, clip_coef = res
+                        target_opt._pending_grad_scale = clip_coef
+                        return total_norm
+                return orig_clip(self, plist, max_norm, norm_type=norm_type)
+        return orig_clip(self, parameters, max_norm, norm_type=norm_type)
+
+    _fused_clip_grad_norm_._sana_fused_clip = True
+    Accelerator.clip_grad_norm_ = _fused_clip_grad_norm_
+    _FUSED_CLIP_INSTALLED = True
+
+
 def build_optimizer(model, optimizer_cfg):
     # default parameter-wise config
     logger = get_root_logger()
@@ -164,6 +329,10 @@ def build_optimizer(model, optimizer_cfg):
     optimizer_cfg["paramwise_cfg"] = paramwise_cfg.cfg
     # build optimizer
     optimizer = mm_build_optimizer(model, optimizer_cfg)
+    if type(optimizer) is torch.optim.AdamW and os.environ.get("SANA_OPT_BATCHED_ADAMW", "1") != "0":
+        init_kwargs = {k: v for k, v in optimizer.defaults.items() if k != "decoupled_weight_decay"}
+        optimizer = _BatchedGroupAdamW(optimizer.param_groups, **init_kwargs)
+        _install_fused_grad_clip_hook()
 
     weight_decay_groups = dict()
     lr_groups = dict()

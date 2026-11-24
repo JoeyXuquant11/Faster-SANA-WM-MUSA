@@ -147,12 +147,15 @@ def _apply_rotary_emb(
     hidden_states: torch.Tensor,
     freqs: torch.Tensor,
 ) -> torch.Tensor:
-    """Compiled rotary embedding application (fuses view_as_complex + multiply chain)."""
-    x_rotated = torch.view_as_complex(
-        hidden_states.permute(0, 1, 3, 2).to(torch.float64).unflatten(3, (-1, 2)),
-    )
-    x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4).permute(0, 1, 3, 2)
-    return x_out.type_as(hidden_states)
+    """Apply rotary embedding in FP32 real arithmetic (avoids slow FP64/complex128 on MUSA)."""
+    x_pair = hidden_states.permute(0, 1, 3, 2).float().unflatten(3, (-1, 2))
+    x0 = x_pair[..., 0]
+    x1 = x_pair[..., 1]
+    cos = freqs.real.float()
+    sin = freqs.imag.float()
+    out0 = x0 * cos - x1 * sin
+    out1 = x1 * cos + x0 * sin
+    return torch.stack((out0, out1), dim=-1).flatten(3, 4).permute(0, 1, 3, 2).type_as(hidden_states)
 
 
 @torch.compile(disable=_COMPILE_DISABLE)
@@ -163,7 +166,12 @@ def _apply_output_gate(
     gate_bias: torch.Tensor,
 ) -> torch.Tensor:
     """Compiled output gate (fuses linear + silu + multiply)."""
-    gate = F.silu(F.linear(gate_x, gate_weight, gate_bias).to(torch.float32))
+    from diffusion.model.musa_ops.block_fusion import can_use_block_fusion, fast_linear_bf16, fused_silu_mul
+
+    g = fast_linear_bf16(gate_x, gate_weight, gate_bias)
+    if can_use_block_fusion(out) and g.dtype == torch.bfloat16:
+        return fused_silu_mul(out, g)
+    gate = F.silu(g.to(torch.float32))
     return out * gate
 
 
@@ -818,7 +826,49 @@ def _forward_softmax_attn(
     if token_valid_mask is not None:
         x = x * token_valid_mask.view(B, N, 1)
 
-    qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
+    from diffusion.model.musa_ops.block_fusion import can_use_block_fusion, fast_linear_bf16, fused_softmax_main_prep
+    precomputed_qkv = kwargs.get("precomputed_qkv", None)
+    if precomputed_qkv is not None and token_valid_mask is None:
+        qkv = precomputed_qkv.reshape(B, N, 3, self.heads, self.dim)
+    else:
+        qkv = fast_linear_bf16(x, self.qkv.weight, self.qkv.bias).reshape(B, N, 3, self.heads, self.dim)
+
+    if (
+        token_valid_mask is None
+        and not frame_causal
+        and not cp_enabled()
+        and can_use_block_fusion(x)
+        and self.dim == 112
+        and rotary_emb is not None
+    ):
+        ucpe_cache = kwargs.get("_ucpe_cache", None)
+        if (
+            ucpe_cache is not None
+            and ucpe_cache.HW == HW
+            and ucpe_cache.head_dim == self.dim
+            and ucpe_cache.rope_cos_main is not None
+        ):
+            rope_cos, rope_sin = ucpe_cache.rope_cos_main, ucpe_cache.rope_sin_main
+        else:
+            freqs = rotary_emb.squeeze(0).squeeze(0)
+            cos_h = freqs.real.float()
+            sin_h = freqs.imag.float()
+            rope_cos = cos_h.repeat_interleave(2, dim=-1).contiguous()
+            rope_sin = torch.stack([-sin_h, sin_h], dim=-1).reshape(N, self.dim).contiguous()
+        has_norm = not isinstance(self.q_norm, nn.Identity)
+        q_nw = self.q_norm.weight if has_norm else None
+        k_nw = self.k_norm.weight if has_norm else None
+        norm_eps = float(getattr(self.q_norm, "eps", 1e-5)) if has_norm else 1e-5
+        q, k, v = fused_softmax_main_prep(qkv, q_nw, k_nw, rope_cos, rope_sin, norm_eps)
+        out = F.scaled_dot_product_attention(q, k, v)
+        from diffusion.model.musa_ops.block_fusion import fused_bhnd_to_bnc
+        out = fused_bhnd_to_bnc(out)
+        if apply_output_gate:
+            if hasattr(self, "proj_gate"):
+                out = out * F.silu(self.proj_gate(x))
+            out = self.proj(out)
+        return out
+
     q, k, v = qkv.unbind(2)
     if token_valid_mask is not None:
         m = token_valid_mask.view(B, N, 1, 1)
@@ -927,7 +977,49 @@ def _forward_softmax_attn_chunk_causal(
     if token_valid_mask is not None:
         x = x * token_valid_mask.view(B, N, 1)
 
-    qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
+    from diffusion.model.musa_ops.block_fusion import can_use_block_fusion, fast_linear_bf16, fused_softmax_main_prep
+    precomputed_qkv = kwargs.get("precomputed_qkv", None)
+    if precomputed_qkv is not None and token_valid_mask is None:
+        qkv = precomputed_qkv.reshape(B, N, 3, self.heads, self.dim)
+    else:
+        qkv = fast_linear_bf16(x, self.qkv.weight, self.qkv.bias).reshape(B, N, 3, self.heads, self.dim)
+
+    if (
+        token_valid_mask is None
+        and (chunk_size is None or chunk_size >= T)
+        and not cp_enabled()
+        and can_use_block_fusion(x)
+        and self.dim == 112
+        and rotary_emb is not None
+    ):
+        ucpe_cache = kwargs.get("_ucpe_cache", None)
+        if (
+            ucpe_cache is not None
+            and ucpe_cache.HW == HW
+            and ucpe_cache.head_dim == self.dim
+            and ucpe_cache.rope_cos_main is not None
+        ):
+            rope_cos, rope_sin = ucpe_cache.rope_cos_main, ucpe_cache.rope_sin_main
+        else:
+            freqs = rotary_emb.squeeze(0).squeeze(0)
+            cos_h = freqs.real.float()
+            sin_h = freqs.imag.float()
+            rope_cos = cos_h.repeat_interleave(2, dim=-1).contiguous()
+            rope_sin = torch.stack([-sin_h, sin_h], dim=-1).reshape(N, self.dim).contiguous()
+        has_norm = not isinstance(self.q_norm, nn.Identity)
+        q_nw = self.q_norm.weight if has_norm else None
+        k_nw = self.k_norm.weight if has_norm else None
+        norm_eps = float(getattr(self.q_norm, "eps", 1e-5)) if has_norm else 1e-5
+        q, k, v = fused_softmax_main_prep(qkv, q_nw, k_nw, rope_cos, rope_sin, norm_eps)
+        out = F.scaled_dot_product_attention(q, k, v)
+        from diffusion.model.musa_ops.block_fusion import fused_bhnd_to_bnc
+        out = fused_bhnd_to_bnc(out)
+        if apply_output_gate:
+            if hasattr(self, "proj_gate"):
+                out = out * F.silu(self.proj_gate(x))
+            out = self.proj(out)
+        return out
+
     q, k, v = qkv.unbind(2)
     if token_valid_mask is not None:
         m = token_valid_mask.view(B, N, 1, 1)

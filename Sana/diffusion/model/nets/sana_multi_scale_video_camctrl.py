@@ -56,6 +56,7 @@ from .sana_camctrl_blocks import (
     _maybe_drop_cam_branch,
     _process_camera_conditions_ucpe,
     prepare_prope_fns,
+    prepare_ucpe_cache,
 )
 try:
     from .sana_gdn_blocks_triton import (
@@ -346,6 +347,7 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
             "block_mask": block_mask,
             "camera_conditions": kwargs.get("camera_conditions", None),
             "prope_fns": kwargs.get("prope_fns", None),
+            "_ucpe_cache": kwargs.get("_ucpe_cache", None),
             "camera_embedding": kwargs.get("camera_embedding", None),
             "frame_valid_mask": frame_valid_mask,
         }
@@ -371,30 +373,86 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if kv_cache is not None:
             self_attn_kwargs["kv_cache"] = kv_cache
 
-        x_norm1 = self.norm1(x).reshape(B, num_frames, -1, C)
-        x_msa_in = t2i_modulate(x_norm1, shift_msa, scale_msa).reshape(B, N, C)
-        if frame_token_mask is not None:
-            x_msa_in = x_msa_in * frame_token_mask
+        from diffusion.model.musa_ops.block_fusion import (
+            can_use_block_fusion,
+            fused_add_layernorm_modulate,
+            fused_addmm_bf16,
+            fused_gate_residual,
+            fused_layernorm_modulate,
+            fused_layernorm_modulate_fmean,
+        )
+
+        use_fused_blk = (
+            frame_token_mask is None
+            and can_use_block_fusion(x)
+            and isinstance(self.norm1, nn.LayerNorm)
+            and not self.norm1.elementwise_affine
+            and isinstance(self.norm2, nn.LayerNorm)
+            and not self.norm2.elementwise_affine
+            and isinstance(self.drop_path, nn.Identity)
+        )
+
+        msa_stats = []
+        if use_fused_blk:
+            is_gdn_attn = hasattr(self.attn, "beta_proj") and (THW is not None) and (not isinstance(self.attn, _SoftmaxUCPESinglePathLiteLA) if "_SoftmaxUCPESinglePathLiteLA" in globals() else "Softmax" not in type(self.attn).__name__)
+            if is_gdn_attn:
+                x_msa_in, x_msa_frame = fused_layernorm_modulate_fmean(
+                    x, shift_msa, scale_msa, num_frames, THW[0], float(self.norm1.eps), stats_out=msa_stats
+                )
+                self_attn_kwargs["_x_msa_frame"] = x_msa_frame
+            else:
+                x_msa_in = fused_layernorm_modulate(
+                    x, shift_msa, scale_msa, num_frames, float(self.norm1.eps), stats_out=msa_stats
+                )
+            if msa_stats and not self.flash_attn_additional:
+                self_attn_kwargs["_x_msa_ln_stats"] = msa_stats[0]
+        else:
+            x_norm1 = self.norm1(x).reshape(B, num_frames, -1, C)
+            x_msa_in = t2i_modulate(x_norm1, shift_msa, scale_msa).reshape(B, N, C)
+            if frame_token_mask is not None:
+                x_msa_in = x_msa_in * frame_token_mask
         attn_out_raw = self.attn(x_msa_in, **self_attn_kwargs)
+        del x_msa_in
+        self_attn_kwargs.pop("_x_msa_ln_stats", None)
+        self_attn_kwargs.pop("_x_msa_frame", None)
         if kv_cache is not None:
             attn_out_raw, kv_cache = attn_out_raw
-        attn_out = attn_out_raw.reshape(B, num_frames, -1, C)
-        attn_out = (gate_msa * attn_out).reshape(B, N, C)
-        if frame_token_mask is not None:
-            attn_out = attn_out * frame_token_mask
-        x = x + self.drop_path(attn_out)
-        if frame_token_mask is not None:
-            x = x * frame_token_mask
 
         delta_pose_emb = kwargs.get("delta_pose_emb", None)
-        if delta_pose_emb is not None and hasattr(self, "delta_pose_proj"):
-            S = N // num_frames
-            dpe = delta_pose_emb.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, N, C)
-            x = x + self.delta_pose_proj(dpe)
-
         plucker_emb = kwargs.get("plucker_emb", None)
-        if plucker_emb is not None and hasattr(self, "plucker_proj"):
-            x = x + self.plucker_proj(plucker_emb)
+        fuse_plucker = (
+            use_fused_blk
+            and (delta_pose_emb is None or not hasattr(self, "delta_pose_proj"))
+            and plucker_emb is not None
+            and hasattr(self, "plucker_proj")
+            and plucker_emb.device.type == "musa"
+            and plucker_emb.dtype == torch.bfloat16
+        )
+
+        if fuse_plucker:
+            x = fused_gate_residual(x, attn_out_raw, gate_msa, num_frames, add_bias=self.plucker_proj.bias)
+            x = fused_addmm_bf16(
+                x, plucker_emb, self.plucker_proj.weight, acc_holder=kwargs.get("_plucker_grad_acc", None)
+            )
+        else:
+            if use_fused_blk:
+                x = fused_gate_residual(x, attn_out_raw, gate_msa, num_frames)
+            else:
+                attn_out = attn_out_raw.reshape(B, num_frames, -1, C)
+                attn_out = (gate_msa * attn_out).reshape(B, N, C)
+                if frame_token_mask is not None:
+                    attn_out = attn_out * frame_token_mask
+                x = x + self.drop_path(attn_out)
+                if frame_token_mask is not None:
+                    x = x * frame_token_mask
+
+            if delta_pose_emb is not None and hasattr(self, "delta_pose_proj"):
+                S = N // num_frames
+                dpe = delta_pose_emb.unsqueeze(2).expand(-1, -1, S, -1).reshape(B, N, C)
+                x = x + self.delta_pose_proj(dpe)
+
+            if plucker_emb is not None and hasattr(self, "plucker_proj"):
+                x = x + self.plucker_proj(plucker_emb)
 
         if self.flash_attn_additional:
             x = x + self.flash_attn_additional(x, HW=THW)
@@ -402,11 +460,13 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
                 x = x * frame_token_mask
 
         if self.cross_attn_image_embeds:
-            x = x + self.cross_attn(x, y, mask=mask, image_embeds=kwargs.get("image_embeds", None))
+            cross_out = self.cross_attn(x, y, mask=mask, image_embeds=kwargs.get("image_embeds", None))
         else:
-            x = x + self.cross_attn(x, y, mask=mask)
-        if frame_token_mask is not None:
-            x = x * frame_token_mask
+            cross_out = self.cross_attn(x, y, mask=mask)
+        if not use_fused_blk:
+            x = x + cross_out
+            if frame_token_mask is not None:
+                x = x * frame_token_mask
 
         mlp_kwargs = {
             "HW": THW,
@@ -428,20 +488,33 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if kv_cache is not None:
             mlp_kwargs["kv_cache"] = kv_cache
 
-        x_norm2 = self.norm2(x).reshape(B, num_frames, -1, C)
-        x_mlp_in = t2i_modulate(x_norm2, shift_mlp, scale_mlp).reshape(B, N, C)
-        if frame_token_mask is not None:
-            x_mlp_in = x_mlp_in * frame_token_mask
+        mlp_stats = []
+        if use_fused_blk:
+            x, x_mlp_in = fused_add_layernorm_modulate(
+                x, cross_out, shift_mlp, scale_mlp, num_frames, float(self.norm2.eps), stats_out=mlp_stats
+            )
+            if mlp_stats:
+                mlp_kwargs["_x_mlp_ln_stats"] = mlp_stats[0]
+        else:
+            x_norm2 = self.norm2(x).reshape(B, num_frames, -1, C)
+            x_mlp_in = t2i_modulate(x_norm2, shift_mlp, scale_mlp).reshape(B, N, C)
+            if frame_token_mask is not None:
+                x_mlp_in = x_mlp_in * frame_token_mask
         mlp_out_raw = self.mlp(x_mlp_in, **mlp_kwargs)
+        del x_mlp_in
+        mlp_kwargs.pop("_x_mlp_ln_stats", None)
         if kv_cache is not None:
             mlp_out_raw, kv_cache = mlp_out_raw
-        mlp_out = mlp_out_raw.reshape(B, num_frames, -1, C)
-        mlp_out = (gate_mlp * mlp_out).reshape(B, N, C)
-        if frame_token_mask is not None:
-            mlp_out = mlp_out * frame_token_mask
-        x = x + self.drop_path(mlp_out)
-        if frame_token_mask is not None:
-            x = x * frame_token_mask
+        if use_fused_blk:
+            x = fused_gate_residual(x, mlp_out_raw, gate_mlp, num_frames)
+        else:
+            mlp_out = mlp_out_raw.reshape(B, num_frames, -1, C)
+            mlp_out = (gate_mlp * mlp_out).reshape(B, N, C)
+            if frame_token_mask is not None:
+                mlp_out = mlp_out * frame_token_mask
+            x = x + self.drop_path(mlp_out)
+            if frame_token_mask is not None:
+                x = x * frame_token_mask
 
         if kv_cache is not None:
             return x, kv_cache
@@ -485,17 +558,57 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + t.reshape(B, 6, -1)
         ).chunk(6, dim=1)
-        x_sa_in = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
-        if frame_token_mask is not None:
-            x_sa_in = x_sa_in * frame_token_mask
+
+        from diffusion.model.musa_ops.block_fusion import (
+            can_use_block_fusion,
+            fused_add_layernorm_modulate,
+            fused_addmm_bf16,
+            fused_gate_residual,
+            fused_layernorm_modulate,
+            fused_layernorm_modulate_fmean,
+        )
+
+        use_fused_blk = (
+            frame_token_mask is None
+            and self.block_hook is None
+            and not self.flash_attn_additional
+            and can_use_block_fusion(x)
+            and isinstance(self.norm1, nn.LayerNorm)
+            and not self.norm1.elementwise_affine
+            and isinstance(self.norm2, nn.LayerNorm)
+            and not self.norm2.elementwise_affine
+            and isinstance(self.drop_path, nn.Identity)
+        )
+
+        msa_stats = []
+        x_msa_frame = None
+        if use_fused_blk:
+            is_gdn_attn = hasattr(self.attn, "beta_proj") and (THW is not None) and ("Softmax" not in type(self.attn).__name__)
+            if is_gdn_attn:
+                x_sa_in, x_msa_frame = fused_layernorm_modulate_fmean(
+                    x, shift_msa, scale_msa, 1, THW[0], float(self.norm1.eps), stats_out=msa_stats
+                )
+            else:
+                x_sa_in = fused_layernorm_modulate(
+                    x, shift_msa, scale_msa, 1, float(self.norm1.eps), stats_out=msa_stats
+                )
+        else:
+            x_sa_in = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
+            if frame_token_mask is not None:
+                x_sa_in = x_sa_in * frame_token_mask
         self_attn_kwargs = {
             "HW": THW,
             "rotary_emb": rotary_emb,
             "block_mask": block_mask,
             "camera_conditions": kwargs.get("camera_conditions", None),
             "prope_fns": kwargs.get("prope_fns", None),
+            "_ucpe_cache": kwargs.get("_ucpe_cache", None),
             "frame_valid_mask": frame_valid_mask,
         }
+        if x_msa_frame is not None:
+            self_attn_kwargs["_x_msa_frame"] = x_msa_frame
+        if msa_stats:
+            self_attn_kwargs["_x_msa_ln_stats"] = msa_stats[0]
         cam_branch_drop_prob = kwargs.get("cam_branch_drop_prob", None)
         if cam_branch_drop_prob is not None:
             self_attn_kwargs["cam_branch_drop_prob"] = cam_branch_drop_prob
@@ -518,6 +631,10 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if kv_cache is not None:
             self_attn_kwargs["kv_cache"] = kv_cache
         x_sa = self.attn(x_sa_in, **self_attn_kwargs)
+        if not self.flash_attn_additional:
+            del x_sa_in
+        self_attn_kwargs.pop("_x_msa_ln_stats", None)
+        self_attn_kwargs.pop("_x_msa_frame", None)
         if kv_cache is not None:
             x_sa, kv_cache = x_sa
         if frame_token_mask is not None:
@@ -530,29 +647,49 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
             if frame_token_mask is not None:
                 x_sa = x_sa * frame_token_mask
 
-        x = x + self.drop_path(gate_msa * x_sa)
-        if frame_token_mask is not None:
-            x = x * frame_token_mask
-
         delta_pose_emb = kwargs.get("delta_pose_emb", None)
-        if delta_pose_emb is not None and hasattr(self, "delta_pose_proj"):
-            T_dp = delta_pose_emb.shape[1]
-            S_dp = N // T_dp
-            dpe = delta_pose_emb.unsqueeze(2).expand(-1, -1, S_dp, -1).reshape(B, N, C)
-            x = x + self.delta_pose_proj(dpe)
-
         plucker_emb = kwargs.get("plucker_emb", None)
-        if plucker_emb is not None and hasattr(self, "plucker_proj"):
-            x = x + self.plucker_proj(plucker_emb)
+        fuse_plucker = (
+            use_fused_blk
+            and (delta_pose_emb is None or not hasattr(self, "delta_pose_proj"))
+            and plucker_emb is not None
+            and hasattr(self, "plucker_proj")
+            and plucker_emb.device.type == "musa"
+            and plucker_emb.dtype == torch.bfloat16
+        )
+
+        if fuse_plucker:
+            x = fused_gate_residual(x, x_sa, gate_msa, 1, add_bias=self.plucker_proj.bias)
+            x = fused_addmm_bf16(
+                x, plucker_emb, self.plucker_proj.weight, acc_holder=kwargs.get("_plucker_grad_acc", None)
+            )
+        else:
+            if use_fused_blk:
+                x = fused_gate_residual(x, x_sa, gate_msa, 1)
+            else:
+                x = x + self.drop_path(gate_msa * x_sa)
+                if frame_token_mask is not None:
+                    x = x * frame_token_mask
+
+            if delta_pose_emb is not None and hasattr(self, "delta_pose_proj"):
+                T_dp = delta_pose_emb.shape[1]
+                S_dp = N // T_dp
+                dpe = delta_pose_emb.unsqueeze(2).expand(-1, -1, S_dp, -1).reshape(B, N, C)
+                x = x + self.delta_pose_proj(dpe)
+
+            if plucker_emb is not None and hasattr(self, "plucker_proj"):
+                x = x + self.plucker_proj(plucker_emb)
 
         if self.cross_attn_image_embeds:
-            x = x + self.cross_attn(x, y, mask=mask, image_embeds=kwargs.get("image_embeds", None))
+            cross_out = self.cross_attn(x, y, mask=mask, image_embeds=kwargs.get("image_embeds", None))
         else:
-            x = x + self.cross_attn(x, y, mask=mask)
-        if frame_token_mask is not None:
-            x = x * frame_token_mask
+            cross_out = self.cross_attn(x, y, mask=mask)
+        if not use_fused_blk:
+            x = x + cross_out
+            if frame_token_mask is not None:
+                x = x * frame_token_mask
 
-        intermediate_feats["x_cross_attn"] = x
+            intermediate_feats["x_cross_attn"] = x
 
         mlp_kwargs = {
             "HW": THW,
@@ -573,17 +710,29 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
             mlp_kwargs["save_kv_cache"] = save_kv_cache
         if kv_cache is not None:
             mlp_kwargs["kv_cache"] = kv_cache
-        x_mlp_in = t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
-        if frame_token_mask is not None:
-            x_mlp_in = x_mlp_in * frame_token_mask
+        mlp_stats = []
+        if use_fused_blk:
+            x, x_mlp_in = fused_add_layernorm_modulate(
+                x, cross_out, shift_mlp, scale_mlp, 1, float(self.norm2.eps), stats_out=mlp_stats
+            )
+            intermediate_feats["x_cross_attn"] = x
+            if mlp_stats:
+                mlp_kwargs["_x_mlp_ln_stats"] = mlp_stats[0]
+        else:
+            x_mlp_in = t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
+            if frame_token_mask is not None:
+                x_mlp_in = x_mlp_in * frame_token_mask
         mlp_out = self.mlp(x_mlp_in, **mlp_kwargs)
         if kv_cache is not None:
             mlp_out, kv_cache = mlp_out
         if frame_token_mask is not None:
             mlp_out = mlp_out * frame_token_mask
-        x = x + self.drop_path(gate_mlp * mlp_out)
-        if frame_token_mask is not None:
-            x = x * frame_token_mask
+        if use_fused_blk:
+            x = fused_gate_residual(x, mlp_out, gate_mlp, 1)
+        else:
+            x = x + self.drop_path(gate_mlp * mlp_out)
+            if frame_token_mask is not None:
+                x = x * frame_token_mask
 
         intermediate_feats["x_ffn"] = x
 
@@ -1042,7 +1191,7 @@ class SanaMSVideoCamCtrl(Sana):
 
         if getattr(self, "use_chunk_plucker_post_attn", False) and "chunk_plucker" in kwargs:
             plucker_input = kwargs["chunk_plucker"].to(self.dtype)
-            kwargs["plucker_emb"] = self.plucker_embedder(plucker_input)
+            kwargs["plucker_emb"] = self.plucker_embedder(plucker_input).contiguous()
 
         image_pos_embed = kwargs.get("pos_embeds", None)
         if self.use_pe and image_pos_embed is None:
@@ -1116,8 +1265,18 @@ class SanaMSVideoCamCtrl(Sana):
             if _xformers_available:
                 y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(1, -1, x.shape[-1])
                 y_lens = mask.sum(dim=1).tolist()
+            elif y.shape[0] == 1 and mask.ndim == 2 and os.environ.get("SANA_OPT_COMPACT_CROSS_MASK", "1") != "0":
+                # Compact valid text tokens once so all 20 CrossAttn layers run mask-free SDPA (exact N0!)
+                valid_idx = torch.nonzero(mask[0], as_tuple=False).squeeze(-1)
+                if valid_idx.numel() > 0:
+                    if valid_idx.numel() < y.shape[2]:
+                        y = y.index_select(2, valid_idx)
+                    y_lens = None
+                else:
+                    y_lens = ((1 - mask.to(x.dtype)) * -10000.0)[:, None, None]
             else:
-                y_lens = mask
+                # Precompute 4D broadcast additive mask once for all 20 CrossAttn blocks
+                y_lens = ((1 - mask.to(x.dtype)) * -10000.0)[:, None, None]
         elif _xformers_available:
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
@@ -1158,8 +1317,7 @@ class SanaMSVideoCamCtrl(Sana):
                                 v = v.squeeze(1)
                         cam_pos_embeds[k] = v
 
-            kwargs["prope_fns"] = prepare_prope_fns(
-                camctrl_type="UCPE",
+            ucpe_cache = prepare_ucpe_cache(
                 head_dim=head_dim,
                 camera_conditions=kwargs["camera_conditions"],
                 HW=(self.f, self.h, self.w),
@@ -1168,27 +1326,91 @@ class SanaMSVideoCamCtrl(Sana):
                 raymats=kwargs.get("raymats"),
                 cam_pos_embeds=cam_pos_embeds,
             )
+            kwargs["prope_fns"] = ucpe_cache.prope_fns
+            kwargs["_ucpe_cache"] = ucpe_cache
+
+        from diffusion.model.musa_ops.async_offload import AsyncBlockOffloader, get_offload_upto
+
+        offload_upto = get_offload_upto() if (torch.is_grad_enabled() and x.device.type == "musa") else 0
+        offloader = None
+        if offload_upto > 0:
+            offloader = getattr(self, "_async_offloader", None)
+            if offloader is None or offloader.device != x.device or offloader.offload_upto != offload_upto:
+                offloader = AsyncBlockOffloader(x.device, offload_upto=offload_upto)
+                self._async_offloader = offloader
+            offloader.reset_step()
+
+        _plucker_emb_orig = kwargs.get("plucker_emb", None)
+        if (
+            torch.is_grad_enabled()
+            and os.environ.get("SANA_OPT_BLOCK_FUSION", "1") != "0"
+            and _plucker_emb_orig is not None
+            and _plucker_emb_orig.requires_grad
+            and _plucker_emb_orig.device.type == "musa"
+            and _plucker_emb_orig.dtype == torch.bfloat16
+            and x.device.type == "musa"
+            and x.dtype == torch.bfloat16
+            and kwargs.get("delta_pose_emb", None) is None
+            and kwargs.get("frame_valid_mask", None) is None
+            and all(
+                hasattr(getattr(b, "_checkpoint_wrapped_module", b), "plucker_proj")
+                and isinstance(getattr(b, "_checkpoint_wrapped_module", b).norm1, nn.LayerNorm)
+                and not getattr(b, "_checkpoint_wrapped_module", b).norm1.elementwise_affine
+                and isinstance(getattr(b, "_checkpoint_wrapped_module", b).norm2, nn.LayerNorm)
+                and not getattr(b, "_checkpoint_wrapped_module", b).norm2.elementwise_affine
+                and isinstance(getattr(b, "_checkpoint_wrapped_module", b).drop_path, nn.Identity)
+                for b in self.blocks
+            )
+        ):
+            from diffusion.model.musa_ops.block_fusion import GradAccBox, flush_shared_grad
+            _plucker_acc = GradAccBox()
+            x = flush_shared_grad(x, _plucker_emb_orig, _plucker_acc)
+            kwargs["plucker_emb"] = _plucker_emb_orig.detach()
+            kwargs["_plucker_grad_acc"] = _plucker_acc
 
         for i, block in enumerate(self.blocks):
+            inner_blk = getattr(block, "_checkpoint_wrapped_module", block)
+            mlp_mod = getattr(inner_blk, "mlp", None)
+            if mlp_mod is not None and getattr(mlp_mod, "_layer_idx", -1) != i:
+                mlp_mod._layer_idx = i
             if self.save_qkv:
                 block.attn.qkv_store_buffer = {}
 
-            x = auto_grad_checkpoint(
-                block,
-                x,
-                y,
-                t0,
-                y_lens,
-                (self.f, self.h, self.w),
-                image_pos_embed,
-                block_mask=block_mask if i > 1 else None,
-                **kwargs,
-                use_reentrant=False,
-            )
+            if offloader is not None:
+                with offloader.block_context(i):
+                    x = auto_grad_checkpoint(
+                        block,
+                        x,
+                        y,
+                        t0,
+                        y_lens,
+                        (self.f, self.h, self.w),
+                        image_pos_embed,
+                        block_mask=block_mask if i > 1 else None,
+                        **kwargs,
+                        use_reentrant=False,
+                    )
+                x = offloader.mark_block_output(x, i)
+            else:
+                x = auto_grad_checkpoint(
+                    block,
+                    x,
+                    y,
+                    t0,
+                    y_lens,
+                    (self.f, self.h, self.w),
+                    image_pos_embed,
+                    block_mask=block_mask if i > 1 else None,
+                    **kwargs,
+                    use_reentrant=False,
+                )
 
             if self.save_qkv:
                 self.qkv_store_buffer[int(timestep[0].item())][f"block_{i}"] = block.attn.qkv_store_buffer
                 block.attn.qkv_store_buffer = None
+
+        if offloader is not None:
+            offloader.finish_forward()
 
         if _delta_t_emb is not None:
             if t.ndim == 2:
@@ -1753,7 +1975,7 @@ class SanaMSVideoCamCtrlStreaming(SanaMSVideoCamCtrl):
 
         if getattr(self, "use_chunk_plucker_post_attn", False) and "chunk_plucker" in kwargs:
             plucker_input = kwargs["chunk_plucker"].to(self.dtype)
-            kwargs["plucker_emb"] = self.plucker_embedder(plucker_input)
+            kwargs["plucker_emb"] = self.plucker_embedder(plucker_input).contiguous()
 
         image_pos_embed = kwargs.get("pos_embeds", None)
         if self.use_pe and image_pos_embed is None:
@@ -1840,8 +2062,18 @@ class SanaMSVideoCamCtrlStreaming(SanaMSVideoCamCtrl):
             if _xformers_available:
                 y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(1, -1, x.shape[-1])
                 y_lens = mask.sum(dim=1).tolist()
+            elif y.shape[0] == 1 and mask.ndim == 2 and os.environ.get("SANA_OPT_COMPACT_CROSS_MASK", "1") != "0":
+                # Compact valid text tokens once so all 20 CrossAttn layers run mask-free SDPA (exact N0!)
+                valid_idx = torch.nonzero(mask[0], as_tuple=False).squeeze(-1)
+                if valid_idx.numel() > 0:
+                    if valid_idx.numel() < y.shape[2]:
+                        y = y.index_select(2, valid_idx)
+                    y_lens = None
+                else:
+                    y_lens = ((1 - mask.to(x.dtype)) * -10000.0)[:, None, None]
             else:
-                y_lens = mask
+                # Precompute 4D broadcast additive mask once for all 20 CrossAttn blocks
+                y_lens = ((1 - mask.to(x.dtype)) * -10000.0)[:, None, None]
         elif _xformers_available:
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
@@ -1882,8 +2114,7 @@ class SanaMSVideoCamCtrlStreaming(SanaMSVideoCamCtrl):
                                 v = v.squeeze(1)
                         cam_pos_embeds[k] = v
 
-            kwargs["prope_fns"] = prepare_prope_fns(
-                camctrl_type="UCPE",
+            ucpe_cache = prepare_ucpe_cache(
                 head_dim=head_dim,
                 camera_conditions=kwargs["camera_conditions"],
                 HW=(self.f, self.h, self.w),
@@ -1892,6 +2123,8 @@ class SanaMSVideoCamCtrlStreaming(SanaMSVideoCamCtrl):
                 raymats=kwargs.get("raymats"),
                 cam_pos_embeds=cam_pos_embeds,
             )
+            kwargs["prope_fns"] = ucpe_cache.prope_fns
+            kwargs["_ucpe_cache"] = ucpe_cache
 
         assert kv_cache is not None and len(kv_cache) == len(
             self.blocks
@@ -1906,7 +2139,39 @@ class SanaMSVideoCamCtrlStreaming(SanaMSVideoCamCtrl):
             if total_tokens > x.shape[1]:
                 kwargs["_cross_attn_pad_to"] = total_tokens
 
+        _plucker_emb_orig = kwargs.get("plucker_emb", None)
+        if (
+            torch.is_grad_enabled()
+            and os.environ.get("SANA_OPT_BLOCK_FUSION", "1") != "0"
+            and _plucker_emb_orig is not None
+            and _plucker_emb_orig.requires_grad
+            and _plucker_emb_orig.device.type == "musa"
+            and _plucker_emb_orig.dtype == torch.bfloat16
+            and x.device.type == "musa"
+            and x.dtype == torch.bfloat16
+            and kwargs.get("delta_pose_emb", None) is None
+            and kwargs.get("frame_valid_mask", None) is None
+            and all(
+                hasattr(getattr(b, "_checkpoint_wrapped_module", b), "plucker_proj")
+                and isinstance(getattr(b, "_checkpoint_wrapped_module", b).norm1, nn.LayerNorm)
+                and not getattr(b, "_checkpoint_wrapped_module", b).norm1.elementwise_affine
+                and isinstance(getattr(b, "_checkpoint_wrapped_module", b).norm2, nn.LayerNorm)
+                and not getattr(b, "_checkpoint_wrapped_module", b).norm2.elementwise_affine
+                and isinstance(getattr(b, "_checkpoint_wrapped_module", b).drop_path, nn.Identity)
+                for b in self.blocks
+            )
+        ):
+            from diffusion.model.musa_ops.block_fusion import GradAccBox, flush_shared_grad
+            _plucker_acc = GradAccBox()
+            x = flush_shared_grad(x, _plucker_emb_orig, _plucker_acc)
+            kwargs["plucker_emb"] = _plucker_emb_orig.detach()
+            kwargs["_plucker_grad_acc"] = _plucker_acc
+
         for i, block in enumerate(self.blocks):
+            inner_blk = getattr(block, "_checkpoint_wrapped_module", block)
+            mlp_mod = getattr(inner_blk, "mlp", None)
+            if mlp_mod is not None and getattr(mlp_mod, "_layer_idx", -1) != i:
+                mlp_mod._layer_idx = i
             if self.save_qkv:
                 block.attn.qkv_store_buffer = {}
 

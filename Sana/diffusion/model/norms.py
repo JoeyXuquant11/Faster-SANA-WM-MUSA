@@ -224,6 +224,10 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
+        from diffusion.model.musa_ops.block_fusion import can_use_fused_rmsnorm, fused_rmsnorm
+
+        if can_use_fused_rmsnorm(x, self.norm_dim):
+            return fused_rmsnorm(x, self.weight, float(self.eps))
         ndim = x.dim()
         weight_shape = [1] * ndim
         weight_shape[self.norm_dim] = -1

@@ -482,6 +482,55 @@ def _forward_cam_branch_softmax(
         dtype=x.dtype,
     )
 
+    from diffusion.model.musa_ops.block_fusion import (
+        can_use_block_fusion,
+        fused_cam_apply_o,
+        fused_softmax_cam_prep,
+    )
+
+    chunk_size_kw = kwargs.get("chunk_size")
+    ucpe_cache = kwargs.get("_ucpe_cache", None)
+    if (
+        token_valid_mask is None
+        and not frame_causal
+        and not cp_enabled()
+        and (chunk_size_kw is None or chunk_size_kw >= T)
+        and self.conv_q_cam is None
+        and self.conv_k_cam is None
+        and self.conv_v_cam is None
+        and can_use_block_fusion(x)
+        and self.cam_head_dim == 112
+        and not isinstance(self.q_norm_cam, nn.Identity)
+        and ucpe_cache is not None
+        and ucpe_cache.cam_cond_id == id(camera_conditions)
+        and ucpe_cache.HW == HW
+        and ucpe_cache.head_dim == self.cam_head_dim
+    ):
+        from diffusion.model.musa_ops.block_fusion import fast_linear_bf16
+
+        precomputed_qkv_cam = kwargs.get("precomputed_qkv_cam", None)
+        if precomputed_qkv_cam is not None:
+            qkv_cam = precomputed_qkv_cam
+        else:
+            qkv_w = torch.cat([self.q_proj_cam.weight, self.k_proj_cam.weight, self.v_proj_cam.weight])
+            qkv_b = torch.cat([self.q_proj_cam.bias, self.k_proj_cam.bias, self.v_proj_cam.bias])
+            qkv_cam = fast_linear_bf16(x, qkv_w, qkv_b)
+        norm_eps = float(getattr(self.q_norm_cam, "eps", getattr(self.q_norm_cam, "variance_epsilon", 1e-6)))
+        q_sdpa, k_sdpa, v_sdpa = fused_softmax_cam_prep(
+            qkv_cam,
+            self.q_norm_cam.weight,
+            self.k_norm_cam.weight,
+            ucpe_cache.P_T,
+            ucpe_cache.P_inv,
+            ucpe_cache.rope_cos_cam,
+            ucpe_cache.rope_sin_cam,
+            self.cam_heads,
+            self.cam_head_dim,
+            norm_eps,
+        )
+        out = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa)
+        return fused_cam_apply_o(out, ucpe_cache.P, ucpe_cache.rope_cos_cam, ucpe_cache.rope_sin_cam)
+
     q_cam_trans, k_cam_trans, v_cam_trans, apply_fn_o = _prepare_cam_qkv_softmax(
         self,
         x,
@@ -610,6 +659,52 @@ class _SoftmaxUCPESinglePathLiteLA(
     ) -> torch.Tensor:
         if HW is None:
             raise ValueError("HW must be provided for softmax attention.")
+        from diffusion.model.musa_ops.block_fusion import (
+            can_use_block_fusion,
+            fast_linear_bf16,
+            fast_triple_linear_qkv_cam_bf16,
+            fused_add_silu_mul_proj,
+        )
+
+        camera_conditions = _maybe_drop_cam_branch(
+            camera_conditions,
+            kwargs.get("cam_branch_drop_prob", 0.0),
+            self.training,
+            x.device,
+        )
+        T_h = HW[0]
+        ucpe_cache = kwargs.get("_ucpe_cache", None)
+        use_triple = (
+            camera_conditions is not None
+            and kwargs.get("frame_valid_mask", None) is None
+            and not cp_enabled()
+            and (chunk_size is None or chunk_size >= T_h)
+            and self.conv_q_cam is None
+            and self.conv_k_cam is None
+            and self.conv_v_cam is None
+            and self.use_output_gate
+            and self.output_gate is not None
+            and can_use_block_fusion(x)
+            and self.cam_head_dim == 112
+            and not isinstance(self.q_norm_cam, nn.Identity)
+            and ucpe_cache is not None
+            and ucpe_cache.cam_cond_id == id(camera_conditions)
+            and ucpe_cache.HW == HW
+            and ucpe_cache.head_dim == self.cam_head_dim
+        )
+        precomputed_qkv = None
+        precomputed_qkv_cam = None
+        precomputed_g = None
+        if use_triple:
+            precomputed_qkv, precomputed_qkv_cam, precomputed_g = fast_triple_linear_qkv_cam_bf16(
+                x,
+                self.qkv.weight, self.qkv.bias,
+                self.q_proj_cam.weight, self.k_proj_cam.weight, self.v_proj_cam.weight,
+                self.q_proj_cam.bias, self.k_proj_cam.bias, self.v_proj_cam.bias,
+                self.output_gate.weight, self.output_gate.bias,
+                ln_stats=kwargs.get("_x_msa_ln_stats", None),
+            )
+
         if chunk_size is not None:
             softmax_kwargs = dict(kwargs)
             chunk_split_strategy = str(softmax_kwargs.pop("chunk_split_strategy", "uniform"))
@@ -623,6 +718,7 @@ class _SoftmaxUCPESinglePathLiteLA(
                 chunk_split_strategy=chunk_split_strategy,
                 chunk_index=chunk_index,
                 apply_output_gate=False,
+                precomputed_qkv=precomputed_qkv,
                 **softmax_kwargs,
             )
         else:
@@ -633,16 +729,11 @@ class _SoftmaxUCPESinglePathLiteLA(
                 rotary_emb,
                 frame_causal=False,
                 apply_output_gate=False,
+                precomputed_qkv=precomputed_qkv,
                 **kwargs,
             )
 
         cam_contrib: torch.Tensor | int = 0
-        camera_conditions = _maybe_drop_cam_branch(
-            camera_conditions,
-            kwargs.get("cam_branch_drop_prob", 0.0),
-            self.training,
-            x.device,
-        )
         if camera_conditions is not None:
             if HW is None:
                 raise ValueError("HW must be provided for UCPE camera branch.")
@@ -654,13 +745,23 @@ class _SoftmaxUCPESinglePathLiteLA(
                 rotary_emb,
                 frame_causal=False,
                 chunk_size=chunk_size,
+                precomputed_qkv_cam=precomputed_qkv_cam,
                 **kwargs,
             )
-            cam_contrib = self.out_proj_cam(cam_raw)
+            cam_contrib = fast_linear_bf16(cam_raw, self.out_proj_cam.weight, self.out_proj_cam.bias)
 
+        if (
+            isinstance(cam_contrib, torch.Tensor)
+            and self.use_output_gate
+            and self.output_gate is not None
+            and can_use_block_fusion(main_raw)
+            and cam_contrib.dtype == torch.bfloat16
+        ):
+            g = precomputed_g if precomputed_g is not None else fast_linear_bf16(x, self.output_gate.weight, self.output_gate.bias)
+            return fused_add_silu_mul_proj(main_raw, cam_contrib, g, self.proj.weight, self.proj.bias)
         combined = main_raw + cam_contrib
         combined = self._apply_output_gate(combined, x)
-        return self.proj(combined.to(x.dtype))
+        return fast_linear_bf16(combined.to(x.dtype), self.proj.weight, self.proj.bias)
 
 
 # Aliases for backward compatibility and clear intent in mappings.

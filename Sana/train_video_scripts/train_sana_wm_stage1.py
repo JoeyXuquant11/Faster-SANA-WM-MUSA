@@ -220,6 +220,339 @@ def _prepare_hf_dataset(config: SanaVideoCamCtrlConfig, accelerator: Accelerator
         config.data.vae_cache_dir = _resolve_under_root(config.data.vae_cache_dir, local_dir)
 
 
+def _passthrough_checkpoint_fn(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+
+def _configure_selective_activation_checkpointing(model, logger) -> None:
+    """Keep CheckpointWrapper module hierarchy intact (exact buffer/state-dict names)
+    while bypassing recompute on selected blocks per SANA_GC_NUM_BLOCKS (default: gdn:9)."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
+    policy = os.environ.get("SANA_GC_NUM_BLOCKS", "gdn:0").strip().lower()
+    blocks = getattr(model, "blocks", None)
+    if blocks is None or policy == "all":
+        return
+
+    n_blocks = len(blocks)
+    if policy in ("0", "none", "false", ""):
+        keep_gc: set[int] = set()
+    elif policy.startswith("gdn:"):
+        k = max(0, int(policy.split(":", 1)[1]))
+        gdn_indices = []
+        for i, blk in enumerate(blocks):
+            inner = getattr(blk, "_checkpoint_wrapped_module", blk)
+            attn = getattr(inner, "attn", None)
+            if "softmax" not in type(attn).__name__.lower():
+                gdn_indices.append(i)
+        keep_gc = set(gdn_indices[:k])
+    elif "," in policy:
+        keep_gc = {int(tok.strip()) for tok in policy.split(",") if tok.strip()}
+    else:
+        k = max(0, min(n_blocks, int(policy)))
+        keep_gc = set(range(k))
+
+    bypassed = []
+    kept = []
+    for i, blk in enumerate(blocks):
+        inner = getattr(blk, "_checkpoint_wrapped_module", blk)
+        # Always disable inner auto_grad_checkpoint to avoid double checkpointing
+        if hasattr(inner, "grad_checkpointing"):
+            inner.grad_checkpointing = False
+        if hasattr(blk, "checkpoint_fn"):
+            if i in keep_gc:
+                kept.append(i)
+            else:
+                blk.checkpoint_impl = CheckpointImpl.NO_REENTRANT
+                blk.checkpoint_fn = _passthrough_checkpoint_fn
+                bypassed.append(i)
+        else:
+            inner.grad_checkpointing = i in keep_gc
+            (kept if i in keep_gc else bypassed).append(i)
+
+    if int(os.environ.get("RANK", "0")) == 0:
+        logger.info(
+            f"[SelectiveGC] policy={policy} | recompute_blocks={kept} ({len(kept)}/{n_blocks}) | "
+            f"zero_recompute_blocks={bypassed} ({len(bypassed)}/{n_blocks})"
+        )
+
+
+class _AlignedCopyBackWork:
+    """Thin dist.Work wrapper for async_op=True aligned collective copy-back."""
+
+    def __init__(self, work, copy_back_fn):
+        self._work = work
+        self._copy_back_fn = copy_back_fn
+
+    def wait(self, timeout=None):
+        if self._work is not None:
+            if timeout is None:
+                self._work.wait()
+            else:
+                self._work.wait(timeout)
+        self._copy_back_fn()
+        return True
+
+
+def _make_aligned16_fsdp_comms():
+    """Return 16-byte-aligned FSDP2 AllGather / ReduceScatter comms.
+
+    On MTT S5000 (MCCL), all_gather_into_tensor / reduce_scatter_tensor fall back
+    from 86+ GB/s (~2.3 ms) to 8.1 GB/s (~24 ms, >10x slower) whenever per-rank
+    byte count is not 16-byte aligned (e.g. odd multiple of 4 bf16 elems).
+    Padding per-rank slice up to 16-byte alignment keeps exact bitwise semantics
+    while restoring full MTLink bandwidth.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
+    from torch.distributed.fsdp._fully_shard._fsdp_collectives import DefaultAllocMixin
+
+    class Aligned16AllGather(DefaultAllocMixin, AllGather):
+        def __call__(self, output_tensor, input_tensor, group, async_op=False):
+            elem_size = input_tensor.element_size()
+            n = input_tensor.numel()
+            bpr = n * elem_size
+            if (
+                bpr < 65536
+                or (bpr % 16 == 0 and input_tensor.data_ptr() % 16 == 0 and output_tensor.data_ptr() % 16 == 0)
+            ):
+                return dist.all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op)
+
+            world = group.size()
+            rank = group.rank()
+            align_elems = max(1, 16 // elem_size)
+            pad_n = ((n + align_elems - 1) // align_elems) * align_elems
+            padded_out = torch.empty((world, pad_n), dtype=input_tensor.dtype, device=input_tensor.device)
+            padded_out[rank, :n].copy_(input_tensor.reshape(-1))
+            work = dist.all_gather_into_tensor(
+                padded_out.view(-1), padded_out[rank], group=group, async_op=async_op
+            )
+            def _copy_back_ag():
+                out_2d = output_tensor.view(world, n)
+                for r in range(world):
+                    out_2d[r].copy_(padded_out[r, :n])
+            if async_op and work is not None:
+                return _AlignedCopyBackWork(work, _copy_back_ag)
+            _copy_back_ag()
+            return work
+
+    class Aligned16ReduceScatter(DefaultAllocMixin, ReduceScatter):
+        def __call__(self, output_tensor, input_tensor, group, op, async_op=False):
+            elem_size = output_tensor.element_size()
+            n = output_tensor.numel()
+            bpr = n * elem_size
+            if (
+                bpr < 65536
+                or (bpr % 16 == 0 and input_tensor.data_ptr() % 16 == 0 and output_tensor.data_ptr() % 16 == 0)
+            ):
+                return dist.reduce_scatter_tensor(
+                    output=output_tensor, input=input_tensor, group=group, op=op, async_op=async_op
+                )
+
+            world = group.size()
+            align_elems = max(1, 16 // elem_size)
+            pad_n = ((n + align_elems - 1) // align_elems) * align_elems
+            padded_in = torch.empty((world, pad_n), dtype=input_tensor.dtype, device=input_tensor.device)
+            in_2d = input_tensor.view(world, n)
+            for r in range(world):
+                padded_in[r, :n].copy_(in_2d[r])
+            if pad_n > n:
+                padded_in[:, n:].zero_()
+            padded_out = torch.empty((pad_n,), dtype=output_tensor.dtype, device=output_tensor.device)
+            work = dist.reduce_scatter_tensor(
+                output=padded_out, input=padded_in.view(-1), group=group, op=op, async_op=async_op
+            )
+            if async_op and work is not None:
+                return _AlignedCopyBackWork(
+                    work, lambda: output_tensor.reshape(-1).copy_(padded_out[:n])
+                )
+            output_tensor.reshape(-1).copy_(padded_out[:n])
+            return work
+
+    return Aligned16AllGather(), Aligned16ReduceScatter()
+
+
+def _configure_aligned_fsdp_comms(model, logger) -> None:
+    if os.environ.get("SANA_OPT_ALIGNED_FSDP_COMM", "1") == "0":
+        return
+    from torch.distributed.fsdp import FSDPModule
+
+    ag_comm, rs_comm = _make_aligned16_fsdp_comms()
+    ag_comm._zero_copy_pad16 = True
+    if os.environ.get("SANA_OPT_ZERO_COPY_PAD16_AG", "1") != "0":
+        import itertools
+        from torch.distributed.fsdp._fully_shard import _fsdp_collectives, _fsdp_param_group
+        if not getattr(_fsdp_collectives, "_sana_zero_copy_pad16_patched", False):
+            _orig_ag = _fsdp_collectives.foreach_all_gather
+            _orig_copy_out = _fsdp_collectives.foreach_all_gather_copy_out
+            _pad_in_cache: dict = {}
+
+            @torch.no_grad()
+            def _patched_foreach_all_gather(
+                fsdp_params, group, async_op,
+                all_gather_copy_in_stream, all_gather_stream,
+                device, all_gather_comm,
+            ):
+                if not getattr(all_gather_comm, "_zero_copy_pad16", False):
+                    return _orig_ag(
+                        fsdp_params, group, async_op,
+                        all_gather_copy_in_stream, all_gather_stream,
+                        device, all_gather_comm,
+                    )
+                world_size, rank = group.size(), group.rank()
+                device_handle = _fsdp_collectives._get_device_handle(device.type)
+                with device_handle.stream(all_gather_copy_in_stream):
+                    param_all_gather_inputs = _fsdp_collectives._get_param_all_gather_inputs(fsdp_params)
+                    (
+                        param_all_gather_input_dtypes,
+                        param_all_gather_input_numels,
+                        dtype,
+                    ) = _fsdp_collectives._get_all_gather_input_metadatas(param_all_gather_inputs)
+                    if dtype == torch.uint8:
+                        all_gather_inputs = [
+                            t.view(torch.uint8) for ts in param_all_gather_inputs for t in ts
+                        ]
+                    else:
+                        all_gather_inputs = [*itertools.chain.from_iterable(param_all_gather_inputs)]
+                    inp_split_sizes = [t.numel() for t in all_gather_inputs]
+                    all_gather_input_numel = sum(inp_split_sizes)
+                    elem_size = all_gather_inputs[0].element_size() if all_gather_inputs else 1
+                    bpr = all_gather_input_numel * elem_size
+                    if bpr >= 65536 and (bpr % 16) != 0:
+                        align_elems = max(1, 16 // elem_size)
+                        pad_n = ((all_gather_input_numel + align_elems - 1) // align_elems) * align_elems
+                        pad_extra = pad_n - all_gather_input_numel
+                        key = (device, dtype, pad_extra)
+                        dummy = _pad_in_cache.get(key)
+                        if dummy is None:
+                            dummy = torch.zeros((pad_extra,), dtype=dtype, device=device)
+                            _pad_in_cache[key] = dummy
+                        all_gather_inputs.append(dummy)
+                        inp_split_sizes.append(pad_extra)
+                        all_gather_input_numel = pad_n
+                    all_gather_output = all_gather_comm.allocate(
+                        (all_gather_input_numel * world_size,), dtype=dtype, device=device
+                    )
+                    all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
+                        all_gather_inputs,
+                        all_gather_output,
+                        inp_split_sizes,
+                        all_gather_input_numel,
+                        rank,
+                    )
+                    del param_all_gather_inputs
+                all_gather_stream.wait_stream(all_gather_copy_in_stream)
+                with device_handle.stream(all_gather_stream):
+                    all_gather_work = all_gather_comm(
+                        output_tensor=all_gather_output,
+                        input_tensor=all_gather_input,
+                        group=group,
+                        async_op=async_op,
+                    )
+                    all_gather_event = all_gather_stream.record_event()
+                    return _fsdp_collectives.AllGatherResult(
+                        all_gather_output,
+                        all_gather_event,
+                        all_gather_work,
+                        param_all_gather_input_dtypes,
+                        param_all_gather_input_numels,
+                        inp_split_sizes,
+                    )
+
+            @torch.no_grad()
+            def _patched_foreach_all_gather_copy_out(all_gather_result, fsdp_params, group):
+                expected_n = sum(len(ns) for ns in all_gather_result.param_all_gather_input_numels)
+                if len(all_gather_result.all_gather_input_split_sizes) != expected_n + 1:
+                    return _orig_copy_out(all_gather_result, fsdp_params, group)
+                (
+                    all_gather_output,
+                    all_gather_event,
+                    all_gather_work,
+                    param_all_gather_input_dtypes,
+                    param_all_gather_input_numels,
+                    all_gather_input_split_sizes,
+                ) = all_gather_result
+                device = all_gather_output.device
+                device_handle = _fsdp_collectives._get_device_handle(device.type)
+                if all_gather_event is not None:
+                    device_handle.current_stream().wait_event(all_gather_event)
+                if isinstance(all_gather_work, dist.distributed_c10d.Work):
+                    all_gather_work.wait()
+                world_size = group.size()
+                split_with_sizes_out = []
+                shard_i_copy_infos = []
+                force_recreate = _fsdp_collectives.compiled_autograd_enabled()
+                for ag_numels, ag_dtypes, fsdp_param in zip(
+                    param_all_gather_input_numels, param_all_gather_input_dtypes, fsdp_params
+                ):
+                    fsdp_param.init_all_gather_outputs(
+                        ag_numels, ag_dtypes, world_size, device, force_recreate=force_recreate
+                    )
+                    if not force_recreate:
+                        fsdp_param.alloc_all_gather_outputs()
+                    param_ag_outs = fsdp_param.all_gather_outputs
+                    if fsdp_param.fsdp_placement.dim != 0:
+                        param_ag_outs = [torch.empty_like(t) for t in param_ag_outs]
+                        shard_i_copy_infos.append((fsdp_param, param_ag_outs))
+                    split_with_sizes_out.extend(param_ag_outs)
+                all_gather_output = all_gather_output.view(world_size, -1)
+                if all_gather_output.dtype == torch.uint8:
+                    out = [t.view(world_size, -1).view(torch.uint8) for t in split_with_sizes_out]
+                else:
+                    out = [t.view(world_size, -1) for t in split_with_sizes_out]
+                pad_extra = all_gather_input_split_sizes[-1]
+                out.append(torch.empty((world_size, pad_extra), dtype=all_gather_output.dtype, device=device))
+                non_inf = [] if torch._dynamo.is_compiling() else [o for o in out if not o.is_inference()]
+                if len(non_inf) > 0:
+                    with torch.autograd._unsafe_preserve_version_counter(tuple(non_inf)):
+                        torch.ops.fsdp.split_with_sizes_copy(
+                            all_gather_output, all_gather_input_split_sizes, dim=1, out=out
+                        )
+                else:
+                    torch.ops.fsdp.split_with_sizes_copy(
+                        all_gather_output, all_gather_input_split_sizes, dim=1, out=out
+                    )
+                for fsdp_param, param_ag_outs in shard_i_copy_infos:
+                    shard_dim = fsdp_param.fsdp_placement.dim
+                    with torch.autograd._unsafe_preserve_version_counter(tuple(fsdp_param.all_gather_outputs)):
+                        for src_t, dst_t in zip(param_ag_outs, fsdp_param.all_gather_outputs):
+                            padded_sharded_size = (
+                                fsdp_param.padded_sharded_param_size
+                                if fsdp_param.sharded_state == _fsdp_collectives.ShardedState.SHARDED
+                                else fsdp_param._sharded_post_forward_param_data.size()
+                            )
+                            pre_sz = list(padded_sharded_size)
+                            pre_sz[0] *= world_size
+                            chunks = torch.chunk(src_t.view(pre_sz), world_size, dim=0)
+                            post_sz = list(padded_sharded_size)
+                            post_sz[shard_dim] *= world_size
+                            torch.cat(chunks, dim=shard_dim, out=dst_t.view(post_sz))
+
+            _fsdp_collectives.foreach_all_gather = _patched_foreach_all_gather
+            _fsdp_collectives.foreach_all_gather_copy_out = _patched_foreach_all_gather_copy_out
+            _fsdp_param_group.foreach_all_gather = _patched_foreach_all_gather
+            _fsdp_param_group.foreach_all_gather_copy_out = _patched_foreach_all_gather_copy_out
+            _fsdp_collectives._sana_zero_copy_pad16_patched = True
+    n_patched = 0
+    for m in model.modules():
+        if isinstance(m, FSDPModule):
+            m.set_custom_all_gather(ag_comm)
+            m.set_custom_reduce_scatter(rs_comm)
+            n_patched += 1
+    n_prefetch = 0
+    if os.environ.get("SANA_OPT_FSDP_FWD_PREFETCH", "0") == "1":
+        blocks = getattr(model, "blocks", None)
+        if blocks is not None:
+            fsdp_blocks = [b for b in blocks if isinstance(b, FSDPModule)]
+            for i in range(len(fsdp_blocks) - 1):
+                fsdp_blocks[i].set_modules_to_forward_prefetch([fsdp_blocks[i + 1]])
+                n_prefetch += 1
+    if int(os.environ.get("RANK", "0")) == 0:
+        logger.info(
+            f"[FSDP2] Installed 16-byte-aligned MCCL AllGather/ReduceScatter on {n_patched} FSDPModules "
+            f"(fwd_prefetch={n_prefetch})"
+        )
+
+
 def _remove_custom_module_call(model, logger) -> None:
     import torch.nn as nn
 
@@ -229,6 +562,8 @@ def _remove_custom_module_call(model, logger) -> None:
         if "__call__" in klass.__dict__:
             logger.info(f"FSDP2: removing custom __call__ from {klass.__name__}")
             delattr(klass, "__call__")
+    _configure_selective_activation_checkpointing(model, logger)
+    _configure_aligned_fsdp_comms(model, logger)
 
 
 def _build_dataloader(config: SanaVideoCamCtrlConfig, max_length: int, dp_size: int, dp_rank: int) -> DataLoader:
@@ -457,6 +792,9 @@ def _extract_batch(batch, device, weight_dtype, load_text_feat: bool, return_chu
     return clean_images, y, y_mask, data_info, camera_conditions, chunk_plucker
 
 
+_CHI_PROMPT_CACHE = {}
+
+
 def _encode_prompts(prompts, tokenizer, text_encoder, config, device):
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -478,9 +816,16 @@ def _encode_prompts(prompts, tokenizer, text_encoder, config, device):
                 max_length_all = max_length
                 encoded_prompts = prompts
             else:
-                chi_prompt = "\n".join(config.text_encoder.chi_prompt)
+                chi_key = (id(tokenizer), tuple(config.text_encoder.chi_prompt))
+                cached_chi = _CHI_PROMPT_CACHE.get(chi_key)
+                if cached_chi is None:
+                    chi_prompt = "\n".join(config.text_encoder.chi_prompt)
+                    num_sys_prompt_tokens = len(tokenizer.encode(chi_prompt))
+                    cached_chi = (chi_prompt, num_sys_prompt_tokens)
+                    _CHI_PROMPT_CACHE[chi_key] = cached_chi
+                else:
+                    chi_prompt, num_sys_prompt_tokens = cached_chi
                 encoded_prompts = [chi_prompt + prompt for prompt in prompts]
-                num_sys_prompt_tokens = len(tokenizer.encode(chi_prompt))
                 max_length_all = num_sys_prompt_tokens + max_length - 2
             txt_tokens = tokenizer(
                 encoded_prompts,
@@ -490,9 +835,16 @@ def _encode_prompts(prompts, tokenizer, text_encoder, config, device):
                 return_tensors="pt",
             ).to(device)
             select_index = [0] + list(range(-max_length + 1, 0))
-            y = text_encoder(txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask)[0][:, None][
-                :, :, select_index
-            ]
+            from diffusion.model.musa_ops.fast_gemma2 import can_use_fast_gemma2, fast_gemma2_forward
+            if can_use_fast_gemma2(text_encoder, txt_tokens.input_ids):
+                hidden_y = fast_gemma2_forward(text_encoder, txt_tokens.input_ids, txt_tokens.attention_mask)
+            else:
+                hidden_y = text_encoder(
+                    txt_tokens.input_ids,
+                    attention_mask=txt_tokens.attention_mask,
+                    use_cache=False,
+                )[0]
+            y = hidden_y[:, None][:, :, select_index]
             y_mask = txt_tokens.attention_mask[:, None, None][:, :, :, select_index]
         elif "Qwen" in config.text_encoder.text_encoder_name:
             y, y_mask = text_encoder.get_prompt_embeds(prompts, max_length=max_length)
