@@ -1,0 +1,5 @@
+{
+  "environment": {
+    "MCCL_BUFFSIZE": "16777216"
+  }
+}

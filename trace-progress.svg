@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" width="960" height="440">
+<rect width="960" height="440" fill="#FFFFFF" rx="10"/>
+<rect x="68" y="74" width="850" height="298" fill="#FAF6F6" stroke="#E5DADA" stroke-width="1"/>
+<text x="68" y="30" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="18" font-weight="700" fill="#241B1C">SANA-WM Stage-1 Bidirectional 720p on 4&#215; MTT S5000 &#8212; 10h Isolated Optimization Trace</text>
+<text x="68" y="51" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="12" fill="#4E4244">Certified check --final: 4.8543&#215; PASS (11.50 &#8594; 2.37 s/iter) &#183; MFU 7.79% &#8594; 37.82% (@500T) &#183; Gemini 4 Neon &#183; 11 rounds</text>
+<line x1="68" y1="344.9" x2="918" y2="344.9" stroke="#EFE6E6" stroke-width="1"/>
+<text x="58" y="348.9" text-anchor="end" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">1&#215;</text>
+<line x1="68" y1="286.5" x2="918" y2="286.5" stroke="#EFE6E6" stroke-width="1"/>
+<text x="58" y="290.5" text-anchor="end" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">2&#215;</text>
+<line x1="68" y1="228.0" x2="918" y2="228.0" stroke="#EFE6E6" stroke-width="1"/>
+<text x="58" y="232.0" text-anchor="end" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">3&#215;</text>
+<line x1="68" y1="169.6" x2="918" y2="169.6" stroke="#EFE6E6" stroke-width="1"/>
+<text x="58" y="173.6" text-anchor="end" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">4&#215;</text>
+<line x1="68" y1="111.2" x2="918" y2="111.2" stroke="#EFE6E6" stroke-width="1"/>
+<text x="58" y="115.2" text-anchor="end" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">5&#215;</text>
+<line x1="68" y1="111.2" x2="918" y2="111.2" stroke="#1BAF7A" stroke-width="1.4" stroke-dasharray="6,4"/>
+<text x="910" y="105.2" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#1BAF7A">Goal target: 5.00&#215; (2.31 s/iter)</text>
+<line x1="68.0" y1="74" x2="68.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
+<text x="68.0" y="392" text-anchor="middle" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">0h</text>
+<line x1="238.0" y1="74" x2="238.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
+<text x="238.0" y="392" text-anchor="middle" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">2h</text>
+<line x1="408.0" y1="74" x2="408.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
+<text x="408.0" y="392" text-anchor="middle" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">4h</text>
+<line x1="578.0" y1="74" x2="578.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
+<text x="578.0" y="392" text-anchor="middle" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">6h</text>
+<line x1="748.0" y1="74" x2="748.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
+<text x="748.0" y="392" text-anchor="middle" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">8h</text>
+<line x1="918.0" y1="74" x2="918.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
+<text x="918.0" y="392" text-anchor="middle" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">10h</text>
+<text x="493" y="420" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="12" fill="#4E4244">Active elapsed wall-clock time (10-hour active budget, strict isolated sandbox)</text>
+<polygon points="76.5,344.9 126.7,344.9 126.7,342.7 174.3,342.7 174.3,332.7 235.5,332.7 235.5,277.0 299.2,277.0 299.2,255.1 323.0,255.1 323.0,239.9 382.5,239.9 382.5,204.4 485.4,204.4 485.4,172.8 614.6,172.8 614.6,151.6 703.0,151.6 703.0,139.2 816.0,139.2 816.0,129.4 918.0,129.4 918.0,117.9 918.0,344.9" fill="#8C0000" fill-opacity="0.08"/>
+<polyline points="76.5,344.9 126.7,344.9 126.7,342.7 174.3,342.7 174.3,332.7 235.5,332.7 235.5,277.0 299.2,277.0 299.2,255.1 323.0,255.1 323.0,239.9 382.5,239.9 382.5,204.4 485.4,204.4 485.4,172.8 614.6,172.8 614.6,151.6 703.0,151.6 703.0,139.2 816.0,139.2 816.0,129.4 918.0,129.4 918.0,117.9" fill="none" stroke="#8C0000" stroke-width="2.6" stroke-linejoin="round"/>
+<circle cx="76.5" cy="344.9" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="126.7" cy="342.7" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="174.3" cy="332.7" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="235.5" cy="277.0" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="299.2" cy="255.1" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="323.0" cy="239.9" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="382.5" cy="204.4" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="485.4" cy="172.8" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="614.6" cy="151.6" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="703.0" cy="139.2" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="816.0" cy="129.4" r="3.8" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<circle cx="918.0" cy="117.9" r="5.2" fill="#8C0000" stroke="#FFFFFF" stroke-width="1.5"/>
+<path d="M897.4,113.0 L906.4,122.0 M906.4,113.0 L897.4,122.0" stroke="#D97706" stroke-width="2.2"/>
+<line x1="895.0" y1="115.0" x2="862.0" y2="95.0" stroke="#D97706" stroke-width="1"/>
+<text x="858.0" y="96.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="600" fill="#D97706">R11a 4.89&#215; (Gate 2 structure &#10007;)</text>
+<text x="78.5" y="362.9" text-anchor="start" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.8" font-weight="600" fill="#241B1C">R0 1.00&#215; (11.57s)</text>
+<text x="174.3" y="321.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="600" fill="#241B1C">R2 1.21&#215; GLUMBConv</text>
+<text x="244.0" y="294.0" text-anchor="start" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.8" font-weight="600" fill="#241B1C">R3 2.16&#215; Fused Bidi-GDN</text>
+<text x="331.0" y="253.0" text-anchor="start" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.8" font-weight="600" fill="#241B1C">R5 2.80&#215; Aligned16 FSDP2</text>
+<text x="390.5" y="218.0" text-anchor="start" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.8" font-weight="600" fill="#241B1C">R6 3.40&#215; Block Fusion</text>
+<text x="479.0" y="162.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.8" font-weight="600" fill="#241B1C">R7 3.95&#215; GDN A/C</text>
+<text x="614.6" y="140.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.8" font-weight="600" fill="#241B1C">R8 4.31&#215; gdn:0</text>
+<text x="703.0" y="128.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="600" fill="#241B1C">R9 4.52&#215;</text>
+<text x="816.0" y="149.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="600" fill="#241B1C">R10 4.69&#215;</text>
+<line x1="914.0" y1="124.0" x2="880.0" y2="165.0" stroke="#8C0000" stroke-width="1.2"/>
+<text x="910.0" y="179.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="11.2" font-weight="700" fill="#8C0000">R11 4.88&#215; / Final 4.85&#215; PASS (2.37 s/iter)</text>
+<rect x="618" y="308" width="290" height="54" rx="6" fill="#FFFFFF" stroke="#E5DADA" stroke-width="1"/>
+<circle cx="635" cy="326" r="4" fill="#8C0000"/>
+<text x="648" y="330" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.5" fill="#241B1C">Accepted PASS round (N0/N1, bench.py check)</text>
+<path d="M631,341 L639,349 M639,341 L631,349" stroke="#D97706" stroke-width="2"/>
+<text x="648" y="349" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="10.5" fill="#241B1C">Rejected by judge (Gate 2 structure, fixed in R11)</text>
+</svg>

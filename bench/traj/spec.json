@@ -1,0 +1,26 @@
+{
+ "case": {
+  "steps": 6,
+  "phase": "train",
+  "track_disp": true,
+  "disp_start_step": 4
+ },
+ "note": "6-step deterministic trajectory (24 samples across DP=4) from the published SANA-WM Stage-1 bidirectional checkpoint. Endpoints combine steady-state training loss over steps [3, 6), cumulative parameter displacement L2 over [4, 6), and single-step top-1% parameter displacement over [4, 6) so 2% learning-rate shifts are resolved cleanly on 1 seed at 3 sigma.",
+ "endpoints": [
+  {
+   "name": "train_loss",
+   "loss": "loss",
+   "steps": [3, 6]
+  },
+  {
+   "name": "param_disp_l2",
+   "loss": "param_disp_l2",
+   "steps": [4, 6]
+  },
+  {
+   "name": "step_disp_top1pct",
+   "loss": "step_disp_top1pct",
+   "steps": [4, 6]
+  }
+ ]
+}

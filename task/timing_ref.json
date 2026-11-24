@@ -1,0 +1,81 @@
+{
+ "total_s": 115.719,
+ "s_per_iteration": 11.5719,
+ "spread": 0.0001,
+ "window_ratio": 0.9985,
+ "peak_memory_allocated_gib": 34.68,
+ "peak_memory_reserved_gib": 35.77,
+ "reference_runs": [
+  115.725,
+  115.713
+ ],
+ "rng_identical_across_runs": true,
+ "rng_fingerprints": {
+  "0": [
+   "9b885050bb0102d4",
+   "0bebc4486a6878e3",
+   "45296c7f16c39339",
+   "d2663112def43ed0",
+   "d00b3b20848bdf5e",
+   "b44a16ce1b83fea9",
+   "a686416da3d3fbf8",
+   "5f0b4fc228d67235",
+   "2f42ead354de7c73",
+   "fd12b7fc333fc231",
+   "4d30312ca51e9696",
+   "f2f528bb255849c8",
+   "4f945d9995092db7"
+  ],
+  "1": [
+   "b6ad3e8039626903",
+   "58dbb1eba1edc352",
+   "aa532279f305d22e",
+   "aa034942623961bc",
+   "f8edcbbd38b75c54",
+   "627c8a90933943ba",
+   "06f19e74b074586a",
+   "8bd7cc3d8d6222df",
+   "f8634dd56045b393",
+   "6425cbc8edeb9e77",
+   "254d9a4273f27aa7",
+   "6cd242e6db8b2605",
+   "51c1745fbbf718ca"
+  ],
+  "2": [
+   "0b22b676f7959992",
+   "f790f37377cbfe75",
+   "89738abb5689ab46",
+   "5f67ef52432f3c2c",
+   "e6e5db272f4c3cb6",
+   "854a0777daccf507",
+   "26214d83ed72f966",
+   "4c1fce9c814710fe",
+   "f978dd2d6c9672aa",
+   "0ad6e0bece70e617",
+   "3822892b046b34f0",
+   "a65eaf25b341cb1f",
+   "4061d91acd61076c"
+  ],
+  "3": [
+   "b5040a90ba61cf0c",
+   "81e3a420bafabc1c",
+   "6f51964249745a95",
+   "60061e81600e7422",
+   "847f14ed00083cc8",
+   "62b0e5a5a46355cc",
+   "6e0c5e07016f59dc",
+   "f94712637493bfb3",
+   "8cba70da6f5e60e4",
+   "66192f0d47672d1e",
+   "a5607e981e587860",
+   "7f37a023fc42b92f",
+   "7f0708bcc91a6e05"
+  ]
+ },
+ "timing_plan": [
+  3,
+  5,
+  2
+ ],
+ "frozen_at": "2026-11-22T18:29:02"
+}

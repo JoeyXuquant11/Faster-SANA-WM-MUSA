@@ -1,0 +1,348 @@
+{
+ "status": "PASS",
+ "final": true,
+ "n1": false,
+ "tree": "$WORK/Sana",
+ "config": "configs/opt.json",
+ "environment": {
+  "MCCL_BUFFSIZE": "16777216"
+ },
+ "correctness": {
+  "stage": "statistical",
+  "measured_tier": "N1",
+  "numerics": {
+   "status": "INCORRECT",
+   "measured_tier": "N1",
+   "report": "$WORK/runs/clawo-final/latest/compare.json",
+   "errors": 0,
+   "exact_failures": [],
+   "bitwise": false,
+   "summary": {
+    "thresholds_sha256": "12ba62ea28074454f72210f151bf1a30427a5f4c650bcefc58f97c3a1d80391b",
+    "errors": 0,
+    "exact_failures": 0,
+    "violations": 25892,
+    "arbitration": 0,
+    "unresolved": 25892,
+    "excluded": 0,
+    "dtype_changes": 0,
+    "precision_mode_changes": 0,
+    "checked": 33176,
+    "bitwise_identical": 7278,
+    "closest": 10,
+    "traced_only_cases": 0,
+    "bitwise_trusted": true
+   }
+  },
+  "trajectory": {
+   "seeds": [
+    3407
+   ],
+   "sigma_k": 3.0,
+   "endpoints": {
+    "train_loss": {
+     "state": "within",
+     "mean": -0.0006510416666666852,
+     "sigma_seed": 0.03671186185638227,
+     "bound": 0.11013558556914681,
+     "mean_in_sigma": -0.01773382317719479,
+     "diffs": [
+      -0.0006510416666666852
+     ]
+    },
+    "param_disp_l2": {
+     "state": "within",
+     "mean": 0.013925241959056756,
+     "sigma_seed": 0.0337424788308084,
+     "bound": 0.1012274364924252,
+     "mean_in_sigma": 0.41269172987795977,
+     "diffs": [
+      0.013925241959056756
+     ]
+    },
+    "step_disp_top1pct": {
+     "state": "within",
+     "mean": -2.32384277487947e-08,
+     "sigma_seed": 5.226888035656523e-08,
+     "bound": 1.5680664106969567e-07,
+     "mean_in_sigma": -0.44459394558039045,
+     "diffs": [
+      -2.32384277487947e-08
+     ]
+    }
+   },
+   "verdict": "equivalent",
+   "report": "$WORK/runs/clawo-final/latest/traj_report.json"
+  },
+  "passed": true,
+  "verdict": "equivalent"
+ },
+ "performance": {
+  "reference_mode": "paired_ref_a_ref_b",
+  "reference_s_per_iteration": 11.5023,
+  "candidate_s_per_iteration": 2.3695,
+  "speedup": 4.8543,
+  "reference_spread": 0.0069,
+  "frozen_reference_s_per_iteration": 11.5719,
+  "runs": {
+   "ref_a": {
+    "status": "ok",
+    "problems": [],
+    "window_s": [
+     57.482,
+     57.143
+    ],
+    "total_s": 114.624,
+    "iterations_timed": 10,
+    "s_per_iteration": 11.4624,
+    "peak_memory_allocated_gib": 34.68,
+    "peak_memory_reserved_gib": 35.77,
+    "startup_to_first_iteration_s": 89.6,
+    "process_wall_s": 234.6,
+    "window_ratio": 1.0059,
+    "window_ratio_vs_frozen": 0.0074,
+    "run_status": "ok",
+    "wall_s": 234.6,
+    "fingerprint": {
+     "argv": [
+      "torchrun --nproc-per-node=4",
+      "timing.py",
+      "--warmup",
+      "3",
+      "--window",
+      "5",
+      "--repeats",
+      "2",
+      "--",
+      "--config_path",
+      "<scratch>/train/recipe_run.yaml"
+     ],
+     "candidate_environment": {},
+     "math_mode": "default",
+     "gpus": [
+      [
+       0,
+       "GPU-0"
+      ],
+      [
+       1,
+       "GPU-1"
+      ],
+      [
+       2,
+       "GPU-2"
+      ],
+      [
+       3,
+       "GPU-3"
+      ]
+     ],
+     "compile_cache": "cold (fresh per run)",
+     "instrumentation": "none",
+     "timing_plan": [
+      3,
+      5,
+      2
+     ],
+     "versions": {
+      "python": "3.10.12",
+      "torch": "2.9.1.post1+musa5.2.0",
+      "torch_musa": "2.9.1.post1+musa5.2.0",
+      "mate": "0.2.5",
+      "tilelang": null,
+      "diffusers": "0.39.0",
+      "transformers": "4.57.3",
+      "accelerate": "1.15.0"
+     }
+    },
+    "log": "$WORK/runs/clawo-final/latest/timing_ref_a.log"
+   },
+   "cand": {
+    "status": "ok",
+    "problems": [],
+    "window_s": [
+     11.848,
+     11.846
+    ],
+    "total_s": 23.695,
+    "iterations_timed": 10,
+    "s_per_iteration": 2.3695,
+    "peak_memory_allocated_gib": 71.03,
+    "peak_memory_reserved_gib": 72.36,
+    "startup_to_first_iteration_s": 76.3,
+    "process_wall_s": 112.1,
+    "window_ratio": 1.0002,
+    "window_ratio_vs_frozen": 0.0017,
+    "run_status": "ok",
+    "wall_s": 112.1,
+    "fingerprint": {
+     "argv": [
+      "torchrun --nproc-per-node=4",
+      "timing.py",
+      "--warmup",
+      "3",
+      "--window",
+      "5",
+      "--repeats",
+      "2",
+      "--",
+      "--config_path",
+      "<scratch>/train/recipe_run.yaml"
+     ],
+     "candidate_environment": {
+      "MCCL_BUFFSIZE": "16777216"
+     },
+     "math_mode": "default",
+     "gpus": [
+      [
+       0,
+       "GPU-0"
+      ],
+      [
+       1,
+       "GPU-1"
+      ],
+      [
+       2,
+       "GPU-2"
+      ],
+      [
+       3,
+       "GPU-3"
+      ]
+     ],
+     "compile_cache": "cold (fresh per run)",
+     "instrumentation": "none",
+     "timing_plan": [
+      3,
+      5,
+      2
+     ],
+     "versions": {
+      "python": "3.10.12",
+      "torch": "2.9.1.post1+musa5.2.0",
+      "torch_musa": "2.9.1.post1+musa5.2.0",
+      "mate": "0.2.5",
+      "tilelang": null,
+      "diffusers": "0.39.0",
+      "transformers": "4.57.3",
+      "accelerate": "1.15.0"
+     }
+    },
+    "log": "$WORK/runs/clawo-final/latest/timing_cand.log"
+   },
+   "ref_b": {
+    "status": "ok",
+    "problems": [],
+    "window_s": [
+     57.635,
+     57.786
+    ],
+    "total_s": 115.422,
+    "iterations_timed": 10,
+    "s_per_iteration": 11.5422,
+    "peak_memory_allocated_gib": 34.68,
+    "peak_memory_reserved_gib": 35.77,
+    "startup_to_first_iteration_s": 81.4,
+    "process_wall_s": 227.1,
+    "window_ratio": 0.9974,
+    "window_ratio_vs_frozen": -0.0011,
+    "run_status": "ok",
+    "wall_s": 227.1,
+    "fingerprint": {
+     "argv": [
+      "torchrun --nproc-per-node=4",
+      "timing.py",
+      "--warmup",
+      "3",
+      "--window",
+      "5",
+      "--repeats",
+      "2",
+      "--",
+      "--config_path",
+      "<scratch>/train/recipe_run.yaml"
+     ],
+     "candidate_environment": {},
+     "math_mode": "default",
+     "gpus": [
+      [
+       0,
+       "GPU-0"
+      ],
+      [
+       1,
+       "GPU-1"
+      ],
+      [
+       2,
+       "GPU-2"
+      ],
+      [
+       3,
+       "GPU-3"
+      ]
+     ],
+     "compile_cache": "cold (fresh per run)",
+     "instrumentation": "none",
+     "timing_plan": [
+      3,
+      5,
+      2
+     ],
+     "versions": {
+      "python": "3.10.12",
+      "torch": "2.9.1.post1+musa5.2.0",
+      "torch_musa": "2.9.1.post1+musa5.2.0",
+      "mate": "0.2.5",
+      "tilelang": null,
+      "diffusers": "0.39.0",
+      "transformers": "4.57.3",
+      "accelerate": "1.15.0"
+     }
+    },
+    "log": "$WORK/runs/clawo-final/latest/timing_ref_b.log"
+   }
+  },
+  "fingerprint_diffs": {
+   "cand": [],
+   "ref_b": []
+  },
+  "reference_pair_window_spread": [
+   0.0027,
+   0.0112
+  ],
+  "problems": [],
+  "benefit": {
+   "speedup": 4.8543,
+   "speedup_bar": 1.02,
+   "peak_memory_allocated_gib": 71.03,
+   "reference_peak_memory_allocated_gib": 34.68,
+   "passed": true
+  }
+ },
+ "source_digest": "e0c5d52ba54d94f008293d85b7d5884be571bd153a7f2afc109bbd717b779e19",
+ "inputs": [
+  {
+   "when": "start",
+   "ok": true,
+   "mismatches": {},
+   "checked": 31,
+   "seconds": 0.2
+  },
+  {
+   "when": "end",
+   "ok": true,
+   "mismatches": {},
+   "checked": 31,
+   "seconds": 0.3
+  }
+ ],
+ "cost": {
+  "gpu_hours": 1.129,
+  "gpu_runs": 5,
+  "method": "GPU lock hold time x 4 cards (startup, warmup and failed runs included)"
+ },
+ "evaluator_sha256": "20ce07dfe6e706e45003c5d3d85f8b8a601297e9743ea9685c21342bfcec5e0b",
+ "finished": "2026-11-23T07:32:49"
+}

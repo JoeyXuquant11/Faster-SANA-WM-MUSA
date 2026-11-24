@@ -1,0 +1,105 @@
+{
+ "task": "SANA-WM Stage-1 bidirectional 720p FSDP2 training (SanaMSVideoCamCtrl_1600M_P1_D20, 193 frames / T=25 latent, 704x1280, batch=1/GPU, DP=4 FSDP2, BF16 + fp32_attention + FP32 AdamW, real weights + Gemma-2-2B-IT) on 4x MTT S5000",
+ "world_size": 4,
+ "per_rank_batch": 1,
+ "agent_max_tier": "N2",
+ "math_mode": "default",
+ "python": "/usr/bin/python3",
+ "torchrun": "/usr/local/bin/torchrun",
+ "pyuser_site": "$ASSETS/pyuser/lib/python3.10/site-packages",
+ "reference": "targets/reference",
+ "reference_commit": "3daa4fbef442e4ee2b7cb6cdb1f26b295312915d",
+ "gpu_lock": "/tmp/sana_wm_gpu.lock",
+ "scratch": "/tmp",
+ "min_scratch_free_gib": 50,
+ "peak_bw_gbs": null,
+ "model_root": "$ASSETS/models/sana_wm",
+ "gemma2_path": "$ASSETS/models/sana_wm/gemma-2-2b-it",
+ "base_yaml": "$ASSETS/recipe_stage1.yaml",
+ "fixture_dir": "$ASSETS/fixture",
+ "numerics": {
+  "adapter": "bench.sana_adapter:SanaWmAdapter",
+  "cases": "bench/cases.json",
+  "sketch_dim": 4096,
+  "ref": "bench/records/ref",
+  "thresholds": "bench/thresholds.json",
+  "keep_records": false,
+  "exclude": []
+ },
+ "timing": {
+  "warmup": 3,
+  "window": 5,
+  "repeats": 2,
+  "reference_runs": 2,
+  "frozen_band": 0.05,
+  "pair_band": 0.03,
+  "window_band": 0.05,
+  "window_band_candidate": 0.15
+ },
+ "benefit": {
+  "min_speedup": 1.02
+ },
+ "trajectory": {
+  "spec": "bench/traj/spec.json",
+  "frozen": "bench/traj/frozen.json",
+  "ref": "bench/traj/ref",
+  "seeds": 1,
+  "sigma_k": 3.0
+ },
+ "timeouts_s": {
+  "timing": 2400,
+  "profile": 2400,
+  "numerics": 2400,
+  "trajectory": 3600
+ },
+ "reserved_env": [
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "TORCHINDUCTOR_CACHE_DIR",
+  "TRITON_CACHE_DIR",
+  "TILELANG_CACHE_DIR",
+  "TVM_CACHE_DIR",
+  "MCC_CACHE_DIR",
+  "CUDA_CACHE_PATH",
+  "XDG_CACHE_HOME",
+  "MPLCONFIGDIR",
+  "CUDA_VISIBLE_DEVICES",
+  "MUSA_VISIBLE_DEVICES",
+  "CUDA_DEVICE_ORDER",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PYTHONNOUSERSITE",
+  "PYTHONUSERBASE",
+  "HF_HOME",
+  "HF_HUB_OFFLINE",
+  "TRANSFORMERS_OFFLINE",
+  "HF_DATASETS_OFFLINE",
+  "SANA_LOCAL_MODEL_ROOT",
+  "SANA_GEMMA2_PATH",
+  "WANDB_MODE",
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "MASTER_ADDR",
+  "MASTER_PORT",
+  "RANK",
+  "WORLD_SIZE",
+  "LOCAL_RANK",
+  "LOCAL_WORLD_SIZE",
+  "PATH",
+  "MKL_NUM_THREADS",
+  "TORCH_COMPILE_DISABLE",
+  "GDN_DISABLE_COMPILE",
+  "DISABLE_XFORMERS"
+ ],
+ "invalid_run_signatures": [
+  {
+   "regex": "hit config\\.(recompile_limit|cache_size_limit)",
+   "reason": "torch.compile hit the recompile limit"
+  },
+  {
+   "regex": "MUSA error|illegal memory access|device-side assert",
+   "reason": "MUSA runtime error reported in log"
+  }
+ ]
+}

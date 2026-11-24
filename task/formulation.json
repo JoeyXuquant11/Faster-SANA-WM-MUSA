@@ -1,0 +1,128 @@
+{
+ "inputs": {
+  "$ASSETS/recipe_stage1.yaml": {
+   "kind": "sha256",
+   "value": "c2b9b328529be356ea0fcf7006f363a36bdcf0b2a9af1abe9b7b5a6e0d31713b"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000.zip": {
+   "kind": "sha256",
+   "value": "67b2b2e4b8521ac637b66338f7ec55176f61665a4ee4fa00df3d053e4d614d37"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000_LongSceneStaticCaption-Qwen3-VL-30B-A3B-Instruct.json": {
+   "kind": "sha256",
+   "value": "c2f4e6123e855ec7fcd805f5c9ac5a2acf2fed7b58d8ec435581f8cbc5358c39"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000_camera.npz": {
+   "kind": "sha256",
+   "value": "470b76ecadc24d3f25653009d1e6101532723ab368fbdf51a65dc842f168de14"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000_dover.json": {
+   "kind": "sha256",
+   "value": "54f371c85a7d7f9d5eed9a8f72ddd3578acfeacfad6af111818333c61c3f2335"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000_unimatch.json": {
+   "kind": "sha256",
+   "value": "16ffa662d6170fdf6f9a31684f6fe93d02a500c419de902d45eb34955733bc36"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000_vlm_entity_filter.json": {
+   "kind": "sha256",
+   "value": "ae6e1437d1c7128f0fbe37fd6c756cc347083cc8e197a6928d03abbf80b3388a"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000_vlm_quality_filter.json": {
+   "kind": "sha256",
+   "value": "62e6089de7b05531955bbc61b9430fbd6ec497ae80f1fc802bf04cf01b49ff62"
+  },
+  "$ASSETS/fixture/raw/sekai_game_train_00000000_vmafmotion.json": {
+   "kind": "sha256",
+   "value": "ae6e1437d1c7128f0fbe37fd6c756cc347083cc8e197a6928d03abbf80b3388a"
+  },
+  "$ASSETS/fixture/vae_cache/sekai_game_train_00000000.zip": {
+   "kind": "stat",
+   "value": "720919446:1795368659833614660"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/.gitattributes": {
+   "kind": "sha256",
+   "value": "3725804fbd61a86f7dc881cee991bc5d4a0ca2055ba3882d508a7a6fe5fed0af"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/LICENSE": {
+   "kind": "sha256",
+   "value": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/README.md": {
+   "kind": "sha256",
+   "value": "f013b380c9b0059be02821857f9638c5b5e9ab88c3bfcd140929c316391495c6"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/config.yaml": {
+   "kind": "sha256",
+   "value": "7dc0b42fa083bcc6964fd488dc41d3a6a738df8677200cb3920082207a26b2dd"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/configuration.json": {
+   "kind": "sha256",
+   "value": "b879028d133581bb543292ad117cbcd83e669758d92544d20bb6490eb19e6bf3"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/dit/sana_wm_1600m_720p.safetensors": {
+   "kind": "stat",
+   "value": "10653012632:1795368059544077332"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/vae/config.json": {
+   "kind": "sha256",
+   "value": "1d402aa299d7c58bf6a30232ee1dcbb0aa41f61237fcb569ef27c2135bfba1cc"
+  },
+  "$ASSETS/models/sana_wm/SANA-WM_bidirectional/vae/diffusion_pytorch_model.safetensors": {
+   "kind": "stat",
+   "value": "2444982370:1795367941500207248"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/.gitattributes": {
+   "kind": "sha256",
+   "value": "6316baeeed69f207d4c1562f368dbc6cedbdf6c204977f61e5895808ba211e32"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/README.md": {
+   "kind": "sha256",
+   "value": "bb52a3f239a1e7b24907644c29e51ff3159fcff5488333d75b1056ddfdd74950"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/config.json": {
+   "kind": "sha256",
+   "value": "b3195cba8e4a8e637f15bc0bab6b48fd0f4e02967fac72925e2dfb02c4d5b8d7"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/configuration.json": {
+   "kind": "sha256",
+   "value": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/gemma-2-2b-it.safetensors": {
+   "kind": "stat",
+   "value": "5228717512:1795368048780727162"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/generation_config.json": {
+   "kind": "sha256",
+   "value": "069b655f964da6484bea4ab6ecfc34f6c5f47448a5b88711218555a76dce34e8"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/model-00001-of-00002.safetensors": {
+   "kind": "stat",
+   "value": "4988025760:1795367810993806211"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/model-00002-of-00002.safetensors": {
+   "kind": "sha256",
+   "value": "6d6d9ce84db398fb6e0191f91542e5da0a73da2cb695e172a24edc2146dc8d20"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/model.safetensors.index.json": {
+   "kind": "sha256",
+   "value": "ada0043f3e3b2e5ab2f445cad9c0fbbf9d91ad444675e6a82b822591c63abf5a"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/special_tokens_map.json": {
+   "kind": "sha256",
+   "value": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/tokenizer.json": {
+   "kind": "sha256",
+   "value": "3f289bc05132635a8bc7aca7aa21255efd5e18f3710f43e3cdb96bcd41be4922"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/tokenizer.model": {
+   "kind": "sha256",
+   "value": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+  },
+  "$ASSETS/models/sana_wm/gemma-2-2b-it/tokenizer_config.json": {
+   "kind": "sha256",
+   "value": "cb32b7929c62608d46572e813112b3ad8a841fb98fdd6a4da8559e368a951c89"
+  }
+ }
+}

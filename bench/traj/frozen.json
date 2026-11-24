@@ -1,0 +1,96 @@
+{
+ "schema": "numerics-trajectory-frozen@2",
+ "spec": {
+  "case": {
+   "steps": 6,
+   "phase": "train",
+   "track_disp": true,
+   "disp_start_step": 4
+  },
+  "note": "6-step deterministic trajectory (24 samples across DP=4) from the published SANA-WM Stage-1 bidirectional checkpoint. Endpoints combine steady-state training loss over steps [3, 6), cumulative parameter displacement L2 over [4, 6), and single-step top-1% parameter displacement over [4, 6) so 2% learning-rate shifts are resolved cleanly on 1 seed at 3 sigma.",
+  "endpoints": [
+   {
+    "name": "train_loss",
+    "loss": "loss",
+    "steps": [
+     3,
+     6
+    ]
+   },
+   {
+    "name": "param_disp_l2",
+    "loss": "param_disp_l2",
+    "steps": [
+     4,
+     6
+    ]
+   },
+   {
+    "name": "step_disp_top1pct",
+    "loss": "step_disp_top1pct",
+    "steps": [
+     4,
+     6
+    ]
+   }
+  ]
+ },
+ "k": 3.0,
+ "reference_seeds": [
+  3407,
+  3408,
+  3409,
+  3410,
+  3411,
+  3412
+ ],
+ "reference_values": {
+  "3407": {
+   "train_loss": 0.3736979166666667,
+   "param_disp_l2": 1.5074826934596115,
+   "step_disp_top1pct": 9.464436785237627e-06
+  },
+  "3408": {
+   "train_loss": 0.3854166666666667,
+   "param_disp_l2": 1.5478873544048406,
+   "step_disp_top1pct": 9.493450642932679e-06
+  },
+  "3409": {
+   "train_loss": 0.375,
+   "param_disp_l2": 1.4758196106607624,
+   "step_disp_top1pct": 9.380959285704001e-06
+  },
+  "3410": {
+   "train_loss": 0.318359375,
+   "param_disp_l2": 1.5251794587241976,
+   "step_disp_top1pct": 9.50896946625523e-06
+  },
+  "3411": {
+   "train_loss": 0.3118489583333333,
+   "param_disp_l2": 1.4810192384563239,
+   "step_disp_top1pct": 9.472127344666421e-06
+  },
+  "3412": {
+   "train_loss": 0.3053385416666667,
+   "param_disp_l2": 1.5570058101054522,
+   "step_disp_top1pct": 9.396384723727501e-06
+  }
+ },
+ "endpoints": {
+  "train_loss": {
+   "reference_mean": 0.3449435763888889,
+   "sigma_seed": 0.03671186185638227,
+   "delta": 0.11013558556914681
+  },
+  "param_disp_l2": {
+   "reference_mean": 1.5157323609685314,
+   "sigma_seed": 0.0337424788308084,
+   "delta": 0.1012274364924252
+  },
+  "step_disp_top1pct": {
+   "reference_mean": 9.45272137475391e-06,
+   "sigma_seed": 5.226888035656523e-08,
+   "delta": 1.5680664106969567e-07
+  }
+ }
+}

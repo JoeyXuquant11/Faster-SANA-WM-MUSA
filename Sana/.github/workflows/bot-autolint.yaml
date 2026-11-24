@@ -1,0 +1,66 @@
+name: Auto Lint (triggered by "auto lint" label)
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - closed
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+# run only one unit test for a branch / tag.
+concurrency:
+  group: ci-lint-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint-by-label:
+    # Same-repo PRs only: this job pushes commits with a write token.
+    if: contains(github.event.pull_request.labels.*.name, 'lint wanted') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.pull_request.head.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.10'
+      - name: Test pre-commit hooks
+        continue-on-error: true
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: --all-files
+      - name: Check if there are any changes
+        id: verify_diff
+        run: |
+          git diff --quiet . || echo "changed=true" >> $GITHUB_OUTPUT
+      - name: Commit files
+        if: steps.verify_diff.outputs.changed == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git commit -m "[CI-Lint] Fix code style issues with pre-commit ${{ github.sha }}" -a
+          git push
+      - name: Remove label(s) after lint
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'lint wanted'
+              });
+            } catch (error) {
+              console.log('Failed to remove label (may already be removed):', error.message);
+            }
