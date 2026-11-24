@@ -14,7 +14,7 @@
 <line x1="68" y1="111.2" x2="918" y2="111.2" stroke="#EFE6E6" stroke-width="1"/>
 <text x="58" y="115.2" text-anchor="end" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">5&#215;</text>
 <line x1="68" y1="111.2" x2="918" y2="111.2" stroke="#1BAF7A" stroke-width="1.4" stroke-dasharray="6,4"/>
-<text x="910" y="105.2" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#1BAF7A">Goal target: 5.00&#215; (2.31 s/iter)</text>
+<text x="78" y="104.2" text-anchor="start" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#1BAF7A">Goal target: 5.00&#215; (2.31 s/iter)</text>
 <line x1="68.0" y1="74" x2="68.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
 <text x="68.0" y="392" text-anchor="middle" font-family="'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#867678">0h</text>
 <line x1="238.0" y1="74" x2="238.0" y2="372" stroke="#EFE6E6" stroke-width="1"/>
